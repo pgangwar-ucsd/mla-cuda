@@ -100,6 +100,7 @@ static constexpr int kScoreThreadsY  = 32;  // 32×4 = 128 keys per block  (Sk �
 static constexpr int kFlatsPerThreadBlock  = kScoreThreadsX * kScoreOutTile;  // 64
 static constexpr int kKsPerThreadBlock     = kScoreThreadsY * kScoreOutTile;  // 128
 static constexpr int kKvRankTile     = 64;  // SMEM tile along kv_rank=512 (reduction dim)
+static constexpr int kRopeDim        = 64;  // qk_rope_head_dim (compile-time for unroll)
 static constexpr int kSkTile         = 4096; // SMEM tile along Sk for ctx kernel attn row
 
 // --- 2a: x @ W_q[:,h,:nope] → Q_nope [B, Sq, H, nope] ---
@@ -351,9 +352,10 @@ std::vector<torch::Tensor> launch_q_absorbed_cuda_kernels(
 // --- 3a. scores: 4×4 output tile per thread; grid (flat B*Sq*H, Sk) ---
 //   grid.x: flat = b*(Sq*128) + q*128 + h     ∈ [0, B*Sq*128)  — 64 flats/block
 //   grid.y: k ∈ [0, Sk)                                        — 128 keys/block
-//   block: 16×32 threads → each thread scores[flat:flat+4, k:k+4]  (64×128 / block)
-//   SMEM per kv_rank tile: qa[64][64] + ck[128][64]; rope: qr[64][64] + pe[128][64]
-//   (ck/pe staged once per key row in the block — all 64 flats share one batch b)
+//   block: 16×32 threads → each thread 4 flats × 4 keys (64×128 / block)
+//   Flat ownership interleaved: lf = tx + di*blockDim.x
+//   SMEM [lf][r] / [lk][r] with col XOR swizzle (no padding): bank = (r^row)%32
+//   Staging: r (or rope d) is idx% — matches HBM contiguous dim for coalescing
 template <typename scalar_t>
 __global__ void mla_scores_smem_kernel(
     const scalar_t* __restrict__ q_absorbed, // [B, Sq, H, kv_rank=512]
@@ -378,137 +380,145 @@ __global__ void mla_scores_smem_kernel(
     float* qa_smem = smem;
     float* ck_smem = qa_smem + kFlatsPerThreadBlock * kKvRankTile;
 
-    const int flat0 = flat_base + threadIdx.x * kScoreOutTile;
-    const int lf0   = threadIdx.x * kScoreOutTile;
-
     // batch for c_kv / pe_cache rows (64 flats/block ⊂ one batch when block < Sq*H)
-    const int b_block = min(flat_base, max(flat_total - 1, 0)) / (sq * num_heads);
-    const int ck_batch_stride = b_block * sk * kv_rank;
-    const int pe_batch_stride = b_block * sk * rope_dim;
+    const int batch_idx = min(flat_base, max(flat_total - 1, 0)) / (sq * num_heads);
+    const int ck_batch_stride = batch_idx * sk * kv_rank;
+    const int pe_batch_stride = batch_idx * sk * rope_dim;
 
     const int coop_stride = blockDim.x * blockDim.y;
+    const float inv_scale = 1.0f / scale;
 
-    float s_nope[kScoreOutTile][kScoreOutTile];
-    float s_rope[kScoreOutTile][kScoreOutTile];
+    // Per-thread output tile; rope later accumulates into the same regs
+    float s[kScoreOutTile][kScoreOutTile];
     #pragma unroll
     for (int di = 0; di < kScoreOutTile; ++di)
         #pragma unroll
         for (int dk = 0; dk < kScoreOutTile; ++dk)
-            s_nope[di][dk] = s_rope[di][dk] = 0.0f;
+            s[di][dk] = 0.0f;
+
+    // Bounds once per thread (outside r / d reduction loops)
+    int lf[kScoreOutTile], lk[kScoreOutTile];
+    int flat[kScoreOutTile], k_idx[kScoreOutTile];
+    bool valid_f[kScoreOutTile], valid_k[kScoreOutTile];
+    #pragma unroll
+    for (int di = 0; di < kScoreOutTile; ++di) {
+        lf[di]      = threadIdx.x + di * blockDim.x;
+        flat[di]    = flat_base + lf[di];
+        valid_f[di] = flat[di] < flat_total;
+    }
+    #pragma unroll
+    for (int dk = 0; dk < kScoreOutTile; ++dk) {
+        lk[dk]      = threadIdx.y * kScoreOutTile + dk;
+        k_idx[dk]   = k0 + lk[dk];
+        valid_k[dk] = k_idx[dk] < sk;
+    }
 
     // ---- Phase 1: scores_nope — fuse qa+ck SMEM loads, one sync per kv_rank tile ----
     for (int r0 = 0; r0 < kv_rank; r0 += kKvRankTile) {
         const int tile_len =
             (r0 + kKvRankTile <= kv_rank) ? kKvRankTile : (kv_rank - r0);
 
-        if (r0 > 0)
-            __syncthreads();  // prior tile compute done before SMEM reuse
-
-        // cooperative: stage Q_absorbed[flat,r0:r0+tile_len] → qa_smem[lf][:]
+        // cooperative: stage Q_absorbed → qa_smem[lf][r^lf]
+        // q_absorbed[flat, r] is contiguous in r → r_local must be idx% so warps coalesce
         const int qa_elems = kFlatsPerThreadBlock * tile_len;
         for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
              idx < qa_elems; idx += coop_stride) {
-            const int lf      = idx / tile_len;
+            const int lf_s    = idx / tile_len;
             const int r_local = idx % tile_len;
-            const int flat    = flat_base + lf;
-            if (flat < flat_total)
-                qa_smem[lf * kKvRankTile + r_local] =
-                    static_cast<float>(q_absorbed[flat * kv_rank + r0 + r_local]);
+            const int flat_s  = flat_base + lf_s;
+            if (flat_s < flat_total)
+                qa_smem[lf_s * kKvRankTile + (r_local ^ (lf_s & (kKvRankTile - 1)))] =
+                    static_cast<float>(q_absorbed[flat_s * kv_rank + r0 + r_local]);
         }
 
-        // cooperative: stage c_kv[b_block,k,r0:r0+tile_len] → ck_smem[lk][:] (once per key)
-        const int ck_elems = kKsPerBlock * tile_len;
+        // cooperative: stage c_kv → ck_smem[lk][r^lk]  (r contiguous in c_kv[k, r])
+        const int ck_elems = kKsPerThreadBlock * tile_len;
         for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
              idx < ck_elems; idx += coop_stride) {
-            const int lk      = idx / tile_len;
+            const int lk_s    = idx / tile_len;
             const int r_local = idx % tile_len;
-            const int k       = k0 + lk;
-            if (k < sk)
-                ck_smem[lk * kKvRankTile + r_local] =
-                    static_cast<float>(c_kv[ck_batch_stride + k * kv_rank + r0 + r_local]);
+            const int k_s     = k0 + lk_s;
+            if (k_s < sk)
+                ck_smem[lk_s * kKvRankTile + (r_local ^ (lk_s & (kKvRankTile - 1)))] =
+                    static_cast<float>(c_kv[ck_batch_stride + k_s * kv_rank + r0 + r_local]);
         }
-        __syncthreads();  // single sync after fused qa+ck loads
+        __syncthreads();  // loads done before any thread reads this tile
 
-        // partial dot from SMEM only — no redundant global c_kv reads
+        // partial dots; bounds already in valid_*
         #pragma unroll
         for (int dk = 0; dk < kScoreOutTile; ++dk) {
-            const int lk = threadIdx.y * kScoreOutTile + dk;
-            const int k  = k0 + threadIdx.y * kScoreOutTile + dk;
-            if (k >= sk) continue;
-
+            if (!valid_k[dk]) continue;
+            const int lk_s = lk[dk];
+            const int lk_m = lk_s & (kKvRankTile - 1);
             #pragma unroll
             for (int di = 0; di < kScoreOutTile; ++di) {
-                const int lf   = lf0 + di;
-                const int flat = flat0 + di;
-                if (flat >= flat_total) continue;
-
+                if (!valid_f[di]) continue;
+                const int lf_s = lf[di];
+                const int lf_m = lf_s & (kKvRankTile - 1);
                 #pragma unroll
-                for (int r_local = 0; r_local < tile_len; ++r_local)
-                    s_nope[di][dk] += qa_smem[lf * kKvRankTile + r_local]
-                                    * ck_smem[lk * kKvRankTile + r_local];
+                for (int r_local = 0; r_local < kKvRankTile; ++r_local) {
+                    if (r_local < tile_len)
+                        s[di][dk] += qa_smem[lf_s * kKvRankTile + (r_local ^ lf_m)]
+                                   * ck_smem[lk_s * kKvRankTile + (r_local ^ lk_m)];
+                }
             }
         }
-        // no post-compute sync — next iter syncs before SMEM overwrite
+        __syncthreads();  // all reads done before next tile (or rope) overwrites SMEM
     }
 
-    // ---- Phase 2: scores_rope — fuse qr+pe SMEM loads, one sync ----
-    __syncthreads();  // phase-1 compute done; reuse SMEM as qr_smem + pe_smem
-
-    float* qr_smem = qa_smem;  // [64][rope_dim]
-    float* pe_smem = ck_smem;  // [128][rope_dim]
+    // ---- Phase 2: scores_rope — accumulate into same s[][] (no second tile regs) ----
+    float* qr_smem = qa_smem;  // [64][rope_dim] with XOR swizzle
+    float* pe_smem = ck_smem;  // [128][rope_dim] with XOR swizzle
 
     const int qr_elems = kFlatsPerThreadBlock * rope_dim;
     for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
          idx < qr_elems; idx += coop_stride) {
-        const int lf = idx / rope_dim;
-        const int d  = idx % rope_dim;
-        const int flat = flat_base + lf;
-        if (flat < flat_total)
-            qr_smem[lf * rope_dim + d] =
-                static_cast<float>(q_rope[flat * rope_dim + d]);
+        // q_rope[flat, d] contiguous in d
+        const int lf_s = idx / rope_dim;
+        const int d    = idx % rope_dim;
+        const int flat_s = flat_base + lf_s;
+        if (flat_s < flat_total)
+            qr_smem[lf_s * rope_dim + (d ^ (lf_s & (rope_dim - 1)))] =
+                static_cast<float>(q_rope[flat_s * rope_dim + d]);
     }
 
-    const int pe_elems = kKsPerBlock * rope_dim;
+    const int pe_elems = kKsPerThreadBlock * rope_dim;
     for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
          idx < pe_elems; idx += coop_stride) {
-        const int lk = idx / rope_dim;
-        const int d  = idx % rope_dim;
-        const int k  = k0 + lk;
-        if (k < sk)
-            pe_smem[lk * rope_dim + d] =
-                static_cast<float>(pe_cache[pe_batch_stride + k * rope_dim + d]);
+        // pe_cache[k, d] contiguous in d
+        const int lk_s = idx / rope_dim;
+        const int d    = idx % rope_dim;
+        const int k_s  = k0 + lk_s;
+        if (k_s < sk)
+            pe_smem[lk_s * rope_dim + (d ^ (lk_s & (rope_dim - 1)))] =
+                static_cast<float>(pe_cache[pe_batch_stride + k_s * rope_dim + d]);
     }
     __syncthreads();
 
     #pragma unroll
     for (int dk = 0; dk < kScoreOutTile; ++dk) {
-        const int lk = threadIdx.y * kScoreOutTile + dk;
-        const int k  = k0 + threadIdx.y * kScoreOutTile + dk;
-        if (k >= sk) continue;
-
+        if (!valid_k[dk]) continue;
+        const int lk_s = lk[dk];
+        const int lk_m = lk_s & (kRopeDim - 1);
         #pragma unroll
         for (int di = 0; di < kScoreOutTile; ++di) {
-            const int lf   = lf0 + di;
-            const int flat = flat0 + di;
-            if (flat >= flat_total) continue;
-
-            float dot = 0.0f;
+            if (!valid_f[di]) continue;
+            const int lf_s = lf[di];
+            const int lf_m = lf_s & (kRopeDim - 1);
             #pragma unroll
-            for (int d = 0; d < rope_dim; ++d)
-                dot += qr_smem[lf * rope_dim + d] * pe_smem[lk * rope_dim + d];
-            s_rope[di][dk] = dot;
+            for (int d = 0; d < kRopeDim; ++d)
+                s[di][dk] += qr_smem[lf_s * kRopeDim + (d ^ lf_m)]
+                           * pe_smem[lk_s * kRopeDim + (d ^ lk_m)];
         }
     }
 
     #pragma unroll
     for (int di = 0; di < kScoreOutTile; ++di) {
-        const int flat = flat0 + di;
-        if (flat >= flat_total) continue;
+        if (!valid_f[di]) continue;
         #pragma unroll
         for (int dk = 0; dk < kScoreOutTile; ++dk) {
-            const int k = k0 + threadIdx.y * kScoreOutTile + dk;
-            if (k >= sk) continue;
-            scores[flat * sk + k] = (s_nope[di][dk] + s_rope[di][dk]) / scale;
+            if (!valid_k[dk]) continue;
+            scores[flat[di] * sk + k_idx[dk]] = s[di][dk] * inv_scale;
         }
     }
 }
@@ -587,27 +597,37 @@ __global__ void mla_ctx_smem_kernel(
     const int ck_batch_stride = b * sk * kv_rank;
     const int ctx_base = (bq_idx * num_heads + head_idx) * kv_rank;
 
-    // ctx[b,q,h,r] = attn[b,q,h,0:Sk] · c_kv[b,0:Sk,r]  → [B,Sq,128,512]
-    for (int r_idx = threadIdx.x; r_idx < kv_rank; r_idx += blockDim.x) {
-        float acc = 0.0f;
-        for (int k0 = 0; k0 < sk; k0 += kSkTile) {
-            const int tile_len =
-                (k0 + kSkTile <= sk) ? kSkTile : (sk - k0);
-            // stage attn[b,q,h,k0:k0+tile_len] → attn_smem[0:tile_len]
-            for (int kl = threadIdx.x; kl < tile_len; kl += blockDim.x)
-                attn_smem[kl] = attn_row[k0 + kl];
-            __syncthreads();
+    // Each thread owns up to two r indices (kv_rank=512, blockDim.x=256)
+    const int r0 = threadIdx.x;
+    const int r1 = threadIdx.x + blockDim.x;
+    float acc0 = 0.0f, acc1 = 0.0f;
 
-            for (int kl = 0; kl < tile_len; ++kl) {
-                const int k = k0 + kl;
-                float ck = static_cast<float>(
-                    c_kv[ck_batch_stride + k * kv_rank + r_idx]);
-                acc += attn_smem[kl] * ck;
-            }
-            __syncthreads();
+    // Tile Sk outermost so ALL threads hit the same __syncthreads (no sync inside
+    // a divergent r-loop). Also loads each attn tile once, not once per r.
+    for (int k0 = 0; k0 < sk; k0 += kSkTile) {
+        const int tile_len =
+            (k0 + kSkTile <= sk) ? kSkTile : (sk - k0);
+
+        for (int kl = threadIdx.x; kl < tile_len; kl += blockDim.x)
+            attn_smem[kl] = attn_row[k0 + kl];
+        __syncthreads();
+
+        for (int kl = 0; kl < tile_len; ++kl) {
+            const int k = k0 + kl;
+            const float a = attn_smem[kl];
+            acc0 += a * static_cast<float>(
+                c_kv[ck_batch_stride + k * kv_rank + r0]);
+            if (r1 < kv_rank)
+                acc1 += a * static_cast<float>(
+                    c_kv[ck_batch_stride + k * kv_rank + r1]);
         }
-        ctx[ctx_base + r_idx] = static_cast<scalar_t>(acc);
+        __syncthreads();
     }
+
+    if (r0 < kv_rank)
+        ctx[ctx_base + r0] = static_cast<scalar_t>(acc0);
+    if (r1 < kv_rank)
+        ctx[ctx_base + r1] = static_cast<scalar_t>(acc1);
 }
 
 // --- 3d. out = ctx @ W_uv: ctx[512] in SMEM, threads over v_dim=128 ---
@@ -675,7 +695,7 @@ torch::Tensor launch_mla_attention(
         dim3 blocks(
             (flat_total + kFlatsPerThreadBlock - 1) / kFlatsPerThreadBlock,
             (sk         + kKsPerThreadBlock    - 1) / kKsPerThreadBlock);
-        // SMEM: qa[64][64] + ck[128][64] floats (qr/pe reuse same buffers)
+        // SMEM: qa[64][64] + ck[128][64] floats with XOR col swizzle (qr/pe reuse)
         size_t smem = static_cast<size_t>(
             kFlatsPerThreadBlock * kKvRankTile + kKsPerThreadBlock * kKvRankTile) * sizeof(float);
         AT_DISPATCH_FLOATING_TYPES_AND_HALF(q_absorbed.scalar_type(), "mla_scores", ([&] {
