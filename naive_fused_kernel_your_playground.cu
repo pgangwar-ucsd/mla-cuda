@@ -103,6 +103,18 @@ static constexpr int kRsPerThreadBlock     = kKsPerThreadBlock;               //
 static constexpr int kKvRankTile     = 64;  // SMEM tile along kv_rank (3a reduction)
 static constexpr int kRopeDim        = 64;  // qk_rope_head_dim (compile-time for unroll)
 static constexpr int kCtxSkTile      = 64;  // SMEM tile along Sk (3c reduction)
+// Kernel 3d: one head per block so W_uv[h] is staged once and reused across bq.
+// x indexes v_dim (contiguous in `out`) so the epilogue stores are coalesced.
+static constexpr int kOutThreadsX    = 32;  // 32×4 = 128 v_dims per block
+static constexpr int kOutThreadsY    = 16;  // 16×4 = 64  bq per block
+static constexpr int kOutVTile       = kOutThreadsX * kScoreOutTile;  // 128
+static constexpr int kOutBqTile      = kOutThreadsY * kScoreOutTile;  // 64
+static constexpr int kOutRTile       = 64;  // SMEM tile along kv_rank (3d reduction)
+// 512 threads × 48 KB SMEM: without a cap nvcc spends 160+ regs on the 4×4 register
+// strip, and 512×160 overflows the 64K register file ("too many resources"). Asking
+// for 2 resident blocks pins it at 64 regs, which also fits 2 blocks of SMEM per SM.
+static constexpr int kTileBlockThreads = 512;
+static constexpr int kTileMinBlocksPerSM = 2;
 
 // --- 2a: x @ W_q[:,h,:nope] → Q_nope [B, Sq, H, nope] ---
 template <typename scalar_t>
@@ -349,7 +361,9 @@ std::vector<torch::Tensor> launch_q_absorbed_cuda_kernels(
 //  3c. ctx — same 16×32 / 4×4 tiling as 3a; grid.x=flat, grid.y=kv_rank
 //      64 flats × 128 ranks/block; Sk contracted in SMEM tiles of kCtxSkTile=64
 //      attn[B,Sq,H,Sk] @ c_kv[B,Sk,512] → ctx[B,Sq,H,512]
-//  3d. out:     [B,Sq,128,512] × [128,128,512] → [B,Sq,128,128]
+//  3d. out — 32×16 / 4×4 tiling; grid.x=bq tiles, grid.y=v tiles, grid.z=head
+//      one head per block so W_uv[h] is staged once and reused across 64 bq
+//      ctx[B,Sq,128,512] × W_uv[128,128,512] → out[B,Sq,128,128]
 // ============================================================================
 
 // --- 3a. scores: 4×4 output tile per thread; grid (flat B*Sq*H, Sk) ---
@@ -361,7 +375,8 @@ std::vector<torch::Tensor> launch_q_absorbed_cuda_kernels(
 //   Staging: r (or rope d) is idx% — matches HBM contiguous dim for coalescing
 //   Reduction is r-outer: 4 qa + 4 ck loads → 16 FMAs, so 0.5 SMEM loads per FMA
 template <typename scalar_t>
-__global__ void mla_scores_smem_kernel(
+__global__ void __launch_bounds__(kTileBlockThreads, kTileMinBlocksPerSM)
+mla_scores_kernel(
     const scalar_t* __restrict__ q_absorbed, // [B, Sq, H, kv_rank=512]
     const scalar_t* __restrict__ q_rope,     // [B, Sq, H, rope_dim=64]
     const scalar_t* __restrict__ c_kv,       // [B, Sk, kv_rank=512]
@@ -622,7 +637,8 @@ __global__ void naive_softmax_kernel(
 //   SMEM [lf][k^lf] / [lr][k^lr]; attn staged k-fast, c_kv staged r-fast (HBM coalesce)
 //   Reduction is k-outer: 4 attn + 4 ck loads → 16 FMAs, so 0.5 SMEM loads per FMA
 template <typename scalar_t>
-__global__ void mla_ctx_smem_kernel(
+__global__ void __launch_bounds__(kTileBlockThreads, kTileMinBlocksPerSM)
+mla_ctx_smem_kernel(
     const float*    __restrict__ attn,  // [B, Sq, H, Sk]
     const scalar_t* __restrict__ c_kv,  // [B, Sk, kv_rank]
     scalar_t*       __restrict__ ctx,   // [B, Sq, H, kv_rank]
@@ -757,39 +773,150 @@ __global__ void mla_ctx_smem_kernel(
     }
 }
 
-// --- 3d. out = ctx @ W_uv: ctx[512] in SMEM, threads over v_dim=128 ---
+// --- 3d. out = ctx @ W_uv: 4×4 tile/thread; grid (bq tiles, v tiles, head) ---
+//   One head per block: W_uv[h] is staged into SMEM once and amortised over the
+//   whole bq tile, instead of being re-read from HBM for every single (bq, h).
+//   grid.x: bq = b*Sq + q                     — 64 bq/block
+//   grid.y: d ∈ [0, v_dim)                    — 128 v_dims/block
+//   grid.z: h ∈ [0, H)                        — the shared W_uv slice
+//   block: 32×16 → each thread 4 v_dims × 4 bq; kv_rank reduced in SMEM tiles of 64
+//   x indexes v_dim so a warp stores 32 contiguous floats of `out`
+//   SMEM [lb][r^lb] / [ld][r^ld] with col XOR swizzle (no padding), r staged fast
+//   Reduction is r-outer: 4 ctx + 4 w loads → 16 FMAs, so 0.5 SMEM loads per FMA
 template <typename scalar_t>
-__global__ void mla_output_smem_kernel(
+__global__ void __launch_bounds__(kTileBlockThreads, kTileMinBlocksPerSM)
+mla_output_smem_kernel(
     const scalar_t* __restrict__ ctx,   // [B, Sq, H, kv_rank]
     const scalar_t* __restrict__ W_uv,  // [H, v_dim, kv_rank]
     scalar_t*       __restrict__ out,   // [B, Sq, H, v_dim]
+    int bq_total,
     int num_heads,
     int kv_rank,
     int v_dim)
 {
-    extern __shared__ float ctx_smem[];
+    const int bq_base   = blockIdx.x * kOutBqTile;
+    const int d_base    = blockIdx.y * kOutVTile;
+    const int head_idx  = blockIdx.z;
 
-    int bq_idx   = blockIdx.x;   // b*sq + q
-    int head_idx = blockIdx.y;   // h
+    extern __shared__ float smem[];
+    float* ctx_smem = smem;                                  // [64][kOutRTile]
+    float* w_smem   = ctx_smem + kOutBqTile * kOutRTile;     // [128][kOutRTile]
 
-    // stage ctx[b,q,h,:] → ctx_smem[512]
-    const int ctx_base = (bq_idx * num_heads + head_idx) * kv_rank;
-    for (int r = threadIdx.x; r < kv_rank; r += blockDim.x)
-        ctx_smem[r] = static_cast<float>(ctx[ctx_base + r]);
-    __syncthreads();
+    // ctx[bq, h, r] and W_uv[h, d, r] are both contiguous in r
+    const int ctx_head_base = head_idx * kv_rank;
+    const int w_head_base   = head_idx * v_dim * kv_rank;
+    const int coop_stride   = blockDim.x * blockDim.y;
 
-    // out[b,q,h,d] = ctx[b,q,h,0:512] · W_uv[h,d,0:512]  → [B,Sq,128,128]
-    // contract r=512 (einsum bqhr,hdr→bqhd)
-    const int out_base = (bq_idx * num_heads + head_idx) * v_dim;
-    for (int d_idx = threadIdx.x; d_idx < v_dim; d_idx += blockDim.x) {
-        float acc = 0.0f;
-        for (int r = 0; r < kv_rank; ++r) {
-            // W_uv [128, 128, 512]: W_uv[h, d, r]
-            float w = static_cast<float>(
-                W_uv[head_idx * v_dim * kv_rank + d_idx * kv_rank + r]);
-            acc += ctx_smem[r] * w;
+    float s[kScoreOutTile][kScoreOutTile];
+    #pragma unroll
+    for (int db = 0; db < kScoreOutTile; ++db)
+        #pragma unroll
+        for (int dd = 0; dd < kScoreOutTile; ++dd)
+            s[db][dd] = 0.0f;
+
+    int lb[kScoreOutTile], ld[kScoreOutTile];
+    int bq[kScoreOutTile], d_idx[kScoreOutTile];
+    bool valid_b[kScoreOutTile], valid_d[kScoreOutTile];
+    #pragma unroll
+    for (int db = 0; db < kScoreOutTile; ++db) {
+        lb[db]      = threadIdx.y * kScoreOutTile + db;
+        bq[db]      = bq_base + lb[db];
+        valid_b[db] = bq[db] < bq_total;
+    }
+    #pragma unroll
+    for (int dd = 0; dd < kScoreOutTile; ++dd) {
+        ld[dd]      = threadIdx.x + dd * blockDim.x;
+        d_idx[dd]   = d_base + ld[dd];
+        valid_d[dd] = d_idx[dd] < v_dim;
+    }
+
+    // XOR swizzle masks — per-thread constants, hoisted out of the reduction
+    int lb_m[kScoreOutTile], ld_m[kScoreOutTile];
+    #pragma unroll
+    for (int db = 0; db < kScoreOutTile; ++db)
+        lb_m[db] = lb[db] & (kOutRTile - 1);
+    #pragma unroll
+    for (int dd = 0; dd < kScoreOutTile; ++dd)
+        ld_m[dd] = ld[dd] & (kOutRTile - 1);
+
+    for (int r0 = 0; r0 < kv_rank; r0 += kOutRTile) {
+        const int tile_len =
+            (r0 + kOutRTile <= kv_rank) ? kOutRTile : (kv_rank - r0);
+
+        // stage ctx[bq_base:+64, h, r0:+tile) — r contiguous → r_local = idx % tile_len
+        const int ctx_elems = kOutBqTile * tile_len;
+        for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
+             idx < ctx_elems; idx += coop_stride) {
+            const int lb_s    = idx / tile_len;
+            const int r_local = idx % tile_len;
+            const int bq_s    = bq_base + lb_s;
+            if (bq_s < bq_total)
+                ctx_smem[lb_s * kOutRTile + (r_local ^ (lb_s & (kOutRTile - 1)))] =
+                    static_cast<float>(
+                        ctx[(bq_s * num_heads) * kv_rank + ctx_head_base + r0 + r_local]);
         }
-        out[out_base + d_idx] = static_cast<scalar_t>(acc);
+
+        // stage W_uv[h, d_base:+128, r0:+tile) — reused by all 64 bq in this block
+        const int w_elems = kOutVTile * tile_len;
+        for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
+             idx < w_elems; idx += coop_stride) {
+            const int ld_s    = idx / tile_len;
+            const int r_local = idx % tile_len;
+            const int d_s     = d_base + ld_s;
+            if (d_s < v_dim)
+                w_smem[ld_s * kOutRTile + (r_local ^ (ld_s & (kOutRTile - 1)))] =
+                    static_cast<float>(
+                        W_uv[w_head_base + d_s * kv_rank + r0 + r_local]);
+        }
+        __syncthreads();
+
+        // r-outer register strip; out-of-range lanes read unwritten SMEM and are
+        // dropped at the store, so no per-iteration bounds predicate is needed
+        if (tile_len == kOutRTile) {
+            #pragma unroll 8
+            for (int r_local = 0; r_local < kOutRTile; ++r_local) {
+                float ctx_reg[kScoreOutTile], w_reg[kScoreOutTile];
+                #pragma unroll
+                for (int db = 0; db < kScoreOutTile; ++db)
+                    ctx_reg[db] = ctx_smem[lb[db] * kOutRTile + (r_local ^ lb_m[db])];
+                #pragma unroll
+                for (int dd = 0; dd < kScoreOutTile; ++dd)
+                    w_reg[dd] = w_smem[ld[dd] * kOutRTile + (r_local ^ ld_m[dd])];
+                #pragma unroll
+                for (int db = 0; db < kScoreOutTile; ++db)
+                    #pragma unroll
+                    for (int dd = 0; dd < kScoreOutTile; ++dd)
+                        s[db][dd] += ctx_reg[db] * w_reg[dd];
+            }
+        } else {
+            // ragged final kv_rank tile: same body, runtime trip count
+            for (int r_local = 0; r_local < tile_len; ++r_local) {
+                float ctx_reg[kScoreOutTile], w_reg[kScoreOutTile];
+                #pragma unroll
+                for (int db = 0; db < kScoreOutTile; ++db)
+                    ctx_reg[db] = ctx_smem[lb[db] * kOutRTile + (r_local ^ lb_m[db])];
+                #pragma unroll
+                for (int dd = 0; dd < kScoreOutTile; ++dd)
+                    w_reg[dd] = w_smem[ld[dd] * kOutRTile + (r_local ^ ld_m[dd])];
+                #pragma unroll
+                for (int db = 0; db < kScoreOutTile; ++db)
+                    #pragma unroll
+                    for (int dd = 0; dd < kScoreOutTile; ++dd)
+                        s[db][dd] += ctx_reg[db] * w_reg[dd];
+            }
+        }
+        __syncthreads();  // all reads done before the next tile overwrites SMEM
+    }
+
+    #pragma unroll
+    for (int db = 0; db < kScoreOutTile; ++db) {
+        if (!valid_b[db]) continue;
+        const int out_base = (bq[db] * num_heads + head_idx) * v_dim;
+        #pragma unroll
+        for (int dd = 0; dd < kScoreOutTile; ++dd) {
+            if (!valid_d[dd]) continue;
+            out[out_base + d_idx[dd]] = static_cast<scalar_t>(s[db][dd]);
+        }
     }
 }
 
@@ -826,7 +953,7 @@ torch::Tensor launch_mla_attention(
         size_t smem = static_cast<size_t>(
             kFlatsPerThreadBlock * kKvRankTile + kKsPerThreadBlock * kKvRankTile) * sizeof(float);
         AT_DISPATCH_FLOATING_TYPES_AND_HALF(q_absorbed.scalar_type(), "mla_scores", ([&] {
-            mla_scores_smem_kernel<scalar_t><<<blocks, threads, smem>>>(
+            mla_scores_kernel<scalar_t><<<blocks, threads, smem>>>(
                 q_absorbed.data_ptr<scalar_t>(), q_rope.data_ptr<scalar_t>(),
                 c_kv.data_ptr<scalar_t>(),       pe_cache.data_ptr<scalar_t>(),
                 scores.data_ptr<float>(),
@@ -863,15 +990,23 @@ torch::Tensor launch_mla_attention(
         cudaDeviceSynchronize();
     }
 
-    // 3d: grid (B*Sq, 128); SMEM ctx[512] × W_uv → out [B,Sq,128,128]
+    // 3d: grid.x=bq tiles, grid.y=v_dim tiles, grid.z=head; 32×16 → 64 bq × 128 v/block
+    //     kv_rank reduction in SMEM tiles of kOutRTile=64; W_uv[h] staged per block
     {
-        dim3 blocks(batch_size * sq, num_heads);
-        size_t smem = static_cast<size_t>(kv_rank) * sizeof(float);  // 512 floats
+        const int bq_total = batch_size * sq;
+        dim3 threads(kOutThreadsX, kOutThreadsY);  // 32×16 = 512 threads
+        dim3 blocks(
+            (bq_total + kOutBqTile - 1) / kOutBqTile,
+            (v_dim    + kOutVTile  - 1) / kOutVTile,
+            num_heads);
+        // SMEM: ctx[64][64] + w[128][64] floats with XOR col swizzle
+        size_t smem = static_cast<size_t>(
+            kOutBqTile * kOutRTile + kOutVTile * kOutRTile) * sizeof(float);
         AT_DISPATCH_FLOATING_TYPES_AND_HALF(q_absorbed.scalar_type(), "mla_output", ([&] {
-            mla_output_smem_kernel<scalar_t><<<blocks, kBlockThreads, smem>>>(
+            mla_output_smem_kernel<scalar_t><<<blocks, threads, smem>>>(
                 ctx.data_ptr<scalar_t>(), W_uv.data_ptr<scalar_t>(),
                 out.data_ptr<scalar_t>(),
-                num_heads, kv_rank, v_dim);
+                bq_total, num_heads, kv_rank, v_dim);
         }));
         cudaDeviceSynchronize();
     }
