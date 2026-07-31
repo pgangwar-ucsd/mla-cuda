@@ -116,6 +116,44 @@ static constexpr int kOutRTile       = 64;  // SMEM tile along kv_rank (3d reduc
 static constexpr int kTileBlockThreads = 512;
 static constexpr int kTileMinBlocksPerSM = 2;
 
+// Precision stage 3 stages and accumulates in. fp64 in means fp64 all the way through;
+// fp32 stays fp32; fp16 promotes to fp32, because summing a 512- (kv_rank) or 65536-long
+// (Sk) reduction in half would throw away far more than the staging saves.
+template <typename T> struct AccType         { using type = float;  };
+template <>           struct AccType<double> { using type = double; };
+template <typename T> using acc_t_of = typename AccType<T>::type;
+
+// A function template cannot declare `extern __shared__ acc_t[]` directly: every
+// instantiation would redeclare the one dynamic-SMEM symbol with a different type.
+// Declare it as raw bytes once and reinterpret, which is the standard workaround.
+template <typename T>
+__device__ __forceinline__ T* dynamic_smem() {
+    extern __shared__ __align__(alignof(double)) unsigned char mla_smem_raw[];
+    return reinterpret_cast<T*>(mla_smem_raw);
+}
+
+// Dynamic SMEM above 48 KB (which fp64 tiles need) is opt-in per kernel.
+template <typename KernelFn>
+static void enable_large_smem(KernelFn kernel, size_t smem) {
+    if (smem > 48u * 1024u)
+        cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(smem));
+}
+
+// SM count of the active device, cached — the 3c split-K heuristic needs it on every
+// launch and cudaDeviceGetAttribute is a driver round-trip.
+static int sm_count() {
+    constexpr int kMaxDevices = 16;
+    static int cached[kMaxDevices] = {0};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= kMaxDevices) return 84;  // fall back to an A6000-ish default
+    if (cached[dev] == 0)
+        cudaDeviceGetAttribute(&cached[dev], cudaDevAttrMultiProcessorCount, dev);
+    return cached[dev];
+}
+
 // --- 2a: x @ W_q[:,h,:nope] → Q_nope [B, Sq, H, nope] ---
 template <typename scalar_t>
 __global__ void q_nope_smem_kernel(
@@ -354,16 +392,16 @@ std::vector<torch::Tensor> launch_q_absorbed_cuda_kernels(
 //  3a. scores — grid.x over flat(B,Sq,128), grid.y over Sk
 //      16×32 threads/block → 64×128 scores/block; each thread → 4×4 tile (q × c_kv)
 //      kv_rank=512 contracted in SMEM tiles of kKvRankTile=64 (block-level reduction)
-//      scores_nope: [B,Sq,128,512] @ [B,Sk,512]^T → [B,Sq,128,Sk]
-//      scores_rope: [B,Sq,128,64]  @ [B,Sk,64]^T  → [B,Sq,128,Sk]
+//      scores_nope: [B,Sq,H,512] @ [B,Sk,512]^T → [B,Sq,H,Sk]
+//      scores_rope: [B,Sq,H,64]  @ [B,Sk,64]^T  → [B,Sq,H,Sk]
 //      merge + /sqrt(192)
-//  3b. softmax → attn [B,Sq,128,Sk]   (one block per (B*Sq, H) row)
+//  3b. softmax → attn [B,Sq,H,Sk]   (one block per (B*Sq, H) row)
 //  3c. ctx — same 16×32 / 4×4 tiling as 3a; grid.x=flat, grid.y=kv_rank
 //      64 flats × 128 ranks/block; Sk contracted in SMEM tiles of kCtxSkTile=64
 //      attn[B,Sq,H,Sk] @ c_kv[B,Sk,512] → ctx[B,Sq,H,512]
 //  3d. out — 32×16 / 4×4 tiling; grid.x=bq tiles, grid.y=v tiles, grid.z=head
 //      one head per block so W_uv[h] is staged once and reused across 64 bq
-//      ctx[B,Sq,128,512] × W_uv[128,128,512] → out[B,Sq,128,128]
+//      ctx[B,Sq,H,512] × W_uv[H,128,512] → out[B,Sq,H,128]
 // ============================================================================
 
 // --- 3a. scores: 4×4 output tile per thread; grid (flat B*Sq*H, Sk) ---
@@ -381,23 +419,25 @@ mla_scores_kernel(
     const scalar_t* __restrict__ q_rope,     // [B, Sq, H, rope_dim=64]
     const scalar_t* __restrict__ c_kv,       // [B, Sk, kv_rank=512]
     const scalar_t* __restrict__ pe_cache,   // [B, Sk, rope_dim=64]  head-shared
-    float*          __restrict__ scores,     // [B, Sq, H, Sk]  fp32
+    acc_t_of<scalar_t>* __restrict__ scores, // [B, Sq, H, Sk]  in the accumulate dtype
     int batch_size,
     int sq,
     int sk,
     int num_heads,
     int kv_rank,
     int rope_dim,
-    float scale)
+    acc_t_of<scalar_t> scale)
 {
+    using acc_t = acc_t_of<scalar_t>;
+
     const int flat_total = batch_size * sq * num_heads;  // B*Sq*128
     const int flat_base  = blockIdx.x * kFlatsPerThreadBlock;
     const int k0         = blockIdx.y * kKsPerThreadBlock;
 
     // qa_smem[64][kKvRankTile]; ck_smem[128][kKvRankTile] — reused as qr/pe after phase 1
-    extern __shared__ float smem[];
-    float* qa_smem = smem;
-    float* ck_smem = qa_smem + kFlatsPerThreadBlock * kKvRankTile;
+    acc_t* smem    = dynamic_smem<acc_t>();
+    acc_t* qa_smem = smem;
+    acc_t* ck_smem = qa_smem + kFlatsPerThreadBlock * kKvRankTile;
 
     // batch for c_kv / pe_cache rows (64 flats/block ⊂ one batch when block < Sq*H)
     const int batch_idx = min(flat_base, max(flat_total - 1, 0)) / (sq * num_heads);
@@ -405,15 +445,15 @@ mla_scores_kernel(
     const int pe_batch_stride = batch_idx * sk * rope_dim;
 
     const int coop_stride = blockDim.x * blockDim.y;
-    const float inv_scale = 1.0f / scale;
+    const acc_t inv_scale = acc_t(1) / scale;
 
     // Per-thread output tile; rope later accumulates into the same regs
-    float s[kScoreOutTile][kScoreOutTile];
+    acc_t s[kScoreOutTile][kScoreOutTile];
     #pragma unroll
     for (int di = 0; di < kScoreOutTile; ++di)
         #pragma unroll
         for (int dk = 0; dk < kScoreOutTile; ++dk)
-            s[di][dk] = 0.0f;
+            s[di][dk] = acc_t(0);
 
     // Bounds once per thread (outside r / d reduction loops)
     int lf[kScoreOutTile], lk[kScoreOutTile];
@@ -456,7 +496,7 @@ mla_scores_kernel(
             const int flat_s  = flat_base + lf_s;
             if (flat_s < flat_total)
                 qa_smem[lf_s * kKvRankTile + (r_local ^ (lf_s & (kKvRankTile - 1)))] =
-                    static_cast<float>(q_absorbed[flat_s * kv_rank + r0 + r_local]);
+                    static_cast<acc_t>(q_absorbed[flat_s * kv_rank + r0 + r_local]);
         }
 
         // cooperative: stage c_kv → ck_smem[lk][r^lk]  (r contiguous in c_kv[k, r])
@@ -468,7 +508,7 @@ mla_scores_kernel(
             const int k_s     = k0 + lk_s;
             if (k_s < sk)
                 ck_smem[lk_s * kKvRankTile + (r_local ^ (lk_s & (kKvRankTile - 1)))] =
-                    static_cast<float>(c_kv[ck_batch_stride + k_s * kv_rank + r0 + r_local]);
+                    static_cast<acc_t>(c_kv[ck_batch_stride + k_s * kv_rank + r0 + r_local]);
         }
         __syncthreads();  // loads done before any thread reads this tile
 
@@ -478,7 +518,7 @@ mla_scores_kernel(
         if (tile_len == kKvRankTile) {
             #pragma unroll
             for (int r_local = 0; r_local < kKvRankTile; ++r_local) {
-                float qa_reg[kScoreOutTile], ck_reg[kScoreOutTile];
+                acc_t qa_reg[kScoreOutTile], ck_reg[kScoreOutTile];
                 #pragma unroll
                 for (int di = 0; di < kScoreOutTile; ++di)
                     qa_reg[di] = qa_smem[lf[di] * kKvRankTile + (r_local ^ lf_m[di])];
@@ -494,7 +534,7 @@ mla_scores_kernel(
         } else {
             // ragged final kv_rank tile: same body, runtime trip count
             for (int r_local = 0; r_local < tile_len; ++r_local) {
-                float qa_reg[kScoreOutTile], ck_reg[kScoreOutTile];
+                acc_t qa_reg[kScoreOutTile], ck_reg[kScoreOutTile];
                 #pragma unroll
                 for (int di = 0; di < kScoreOutTile; ++di)
                     qa_reg[di] = qa_smem[lf[di] * kKvRankTile + (r_local ^ lf_m[di])];
@@ -512,8 +552,8 @@ mla_scores_kernel(
     }
 
     // ---- Phase 2: scores_rope — accumulate into same s[][] (no second tile regs) ----
-    float* qr_smem = qa_smem;  // [64][rope_dim] with XOR swizzle
-    float* pe_smem = ck_smem;  // [128][rope_dim] with XOR swizzle
+    acc_t* qr_smem = qa_smem;  // [64][rope_dim] with XOR swizzle
+    acc_t* pe_smem = ck_smem;  // [128][rope_dim] with XOR swizzle
 
     const int qr_elems = kFlatsPerThreadBlock * rope_dim;
     for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
@@ -524,7 +564,7 @@ mla_scores_kernel(
         const int flat_s = flat_base + lf_s;
         if (flat_s < flat_total)
             qr_smem[lf_s * rope_dim + (d ^ (lf_s & (rope_dim - 1)))] =
-                static_cast<float>(q_rope[flat_s * rope_dim + d]);
+                static_cast<acc_t>(q_rope[flat_s * rope_dim + d]);
     }
 
     const int pe_elems = kKsPerThreadBlock * rope_dim;
@@ -536,7 +576,7 @@ mla_scores_kernel(
         const int k_s  = k0 + lk_s;
         if (k_s < sk)
             pe_smem[lk_s * rope_dim + (d ^ (lk_s & (rope_dim - 1)))] =
-                static_cast<float>(pe_cache[pe_batch_stride + k_s * rope_dim + d]);
+                static_cast<acc_t>(pe_cache[pe_batch_stride + k_s * rope_dim + d]);
     }
     __syncthreads();
 
@@ -552,7 +592,7 @@ mla_scores_kernel(
     // d-outer register strip; rope_dim is a full compile-time tile, so no ragged path
     #pragma unroll
     for (int d = 0; d < kRopeDim; ++d) {
-        float qr_reg[kScoreOutTile], pe_reg[kScoreOutTile];
+        acc_t qr_reg[kScoreOutTile], pe_reg[kScoreOutTile];
         #pragma unroll
         for (int di = 0; di < kScoreOutTile; ++di)
             qr_reg[di] = qr_smem[lf[di] * kRopeDim + (d ^ lf_rm[di])];
@@ -579,8 +619,9 @@ mla_scores_kernel(
 
 // --- 3b. Softmax over the Sk dimension, in-place on scores ---
 // One block per (b, q, h) row; threads reduce within the row.
+template <typename acc_t>
 __global__ void naive_softmax_kernel(
-    float* __restrict__ scores,  // [B, Sq, H, Sk]  — modified in place
+    acc_t* __restrict__ scores,  // [B, Sq, H, Sk]  — modified in place
     int batch_size,
     int sq,
     int num_heads,
@@ -591,27 +632,27 @@ __global__ void naive_softmax_kernel(
 
     if (bq_idx >= batch_size * sq || head_idx >= num_heads) return;
 
-    float* row = scores + (bq_idx * num_heads + head_idx) * sk;  // [Sk] of [B,Sq,128,Sk]
+    acc_t* row = scores + (bq_idx * num_heads + head_idx) * sk;  // [Sk] of [B,Sq,128,Sk]
 
-    // max over Sk (numerical stability)
-    float max_val = -1e38f;
+    // max over Sk (numerical stability); -inf so idle threads never win the reduction
+    acc_t max_val = -INFINITY;
     for (int k = threadIdx.x; k < sk; k += blockDim.x)
-        max_val = fmaxf(max_val, row[k]);
+        max_val = fmax(max_val, row[k]);
     // Block-wide reduction of max  (naive: shared memory reduce)
-    __shared__ float smem[256];
+    __shared__ acc_t smem[256];
     smem[threadIdx.x] = max_val;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (threadIdx.x < stride)
-            smem[threadIdx.x] = fmaxf(smem[threadIdx.x], smem[threadIdx.x + stride]);
+            smem[threadIdx.x] = fmax(smem[threadIdx.x], smem[threadIdx.x + stride]);
         __syncthreads();
     }
     max_val = smem[0];
 
     // exp and sum over Sk
-    float sum_exp = 0.0f;
+    acc_t sum_exp = acc_t(0);
     for (int k = threadIdx.x; k < sk; k += blockDim.x) {
-        float e = expf(row[k] - max_val);
+        acc_t e = exp(row[k] - max_val);
         row[k] = e;
         sum_exp += e;
     }
@@ -629,32 +670,69 @@ __global__ void naive_softmax_kernel(
         row[k] /= sum_exp;
 }
 
+// Write one ctx element. The generic template keeps ctx in the input dtype and only ever
+// stores, which is all the split == 1 path needs. Split-K accumulates partials with
+// atomicAdd, and for that case the host promotes ctx to the accumulate dtype — so only
+// the exact-match overloads below have to handle use_atomic. Non-template overloads win
+// overload resolution when ctx_t and acc_t coincide, which is exactly the split-K case.
+template <typename ctx_t, typename acc_t>
+__device__ __forceinline__ void ctx_store(ctx_t* dst, acc_t v, bool /*use_atomic*/) {
+    *dst = static_cast<ctx_t>(v);
+}
+__device__ __forceinline__ void ctx_store(float* dst, float v, bool use_atomic) {
+    if (use_atomic) atomicAdd(dst, v);
+    else            *dst = v;
+}
+__device__ __forceinline__ void ctx_store(double* dst, double v, bool use_atomic) {
+    if (use_atomic) atomicAdd(dst, v);  // fp64 atomicAdd is native from sm_60
+    else            *dst = v;
+}
+
 // --- 3c. ctx = attn @ c_kv: 4×4 tile/thread; grid (flat B*Sq*H, kv_rank) ---
 //   grid.x: flat = b*(Sq*H) + q*H + h     — 64 flats/block
 //   grid.y: r ∈ [0, kv_rank)              — 128 ranks/block
 //   block: 16×32 → each thread 4 flats × 4 ranks; Sk reduced in SMEM tiles of 64
 //   Flat ownership interleaved: lf = tx + di*Bx; lr = ty*4 + dr (same as 3a k-side)
+//   grid.z: split-K slice over Sk — see below
 //   SMEM [lf][k^lf] / [lr][k^lr]; attn staged k-fast, c_kv staged r-fast (HBM coalesce)
 //   Reduction is k-outer: 4 attn + 4 ck loads → 16 FMAs, so 0.5 SMEM loads per FMA
-template <typename scalar_t>
+//
+//   Split-K: the grid only parallelises the output dims (flat × kv_rank), so a
+//   single-stream decode (B=Sq=1 → 128 flats) yields just 2×4 = 8 blocks and leaves
+//   ~90% of the SMs idle while each block walks all of Sk serially. grid.z chops the
+//   Sk reduction into `sk_chunk`-sized slices; each slice accumulates a partial dot
+//   product and atomically adds it into ctx, which the host pre-zeroes. The host sets
+//   gridDim.z == 1 for shapes that already fill the GPU, and `use_atomic` then selects
+//   plain stores so the common path pays neither the memset nor the atomics.
+//   ctx_t is the input dtype on the plain path and the accumulate dtype on the split-K
+//   path (see ctx_store): read-modify-write accumulation never narrows.
+template <typename scalar_t, typename ctx_t>
 __global__ void __launch_bounds__(kTileBlockThreads, kTileMinBlocksPerSM)
-mla_ctx_smem_kernel(
-    const float*    __restrict__ attn,  // [B, Sq, H, Sk]
+mla_ctx_kernel(
+    const acc_t_of<scalar_t>* __restrict__ attn,  // [B, Sq, H, Sk]
     const scalar_t* __restrict__ c_kv,  // [B, Sk, kv_rank]
-    scalar_t*       __restrict__ ctx,   // [B, Sq, H, kv_rank]
+    ctx_t*          __restrict__ ctx,   // [B, Sq, H, kv_rank]
     int batch_size,
     int sq,
     int sk,
     int num_heads,
-    int kv_rank)
+    int kv_rank,
+    int sk_chunk,   // Sk elements owned by one grid.z slice (multiple of kCtxSkTile)
+    bool use_atomic)
 {
+    using acc_t = acc_t_of<scalar_t>;
+
     const int flat_total = batch_size * sq * num_heads;
     const int flat_base  = blockIdx.x * kFlatsPerThreadBlock;
     const int r0         = blockIdx.y * kRsPerThreadBlock;
 
-    extern __shared__ float smem[];
-    float* attn_smem = smem;  // [64][kCtxSkTile]
-    float* ck_smem   = attn_smem + kFlatsPerThreadBlock * kCtxSkTile;  // [128][kCtxSkTile]
+    // this block's slice of the Sk reduction; sk_chunk == sk when gridDim.z == 1
+    const int k_begin = blockIdx.z * sk_chunk;
+    const int k_end   = min(k_begin + sk_chunk, sk);
+
+    acc_t* smem      = dynamic_smem<acc_t>();
+    acc_t* attn_smem = smem;  // [64][kCtxSkTile]
+    acc_t* ck_smem   = attn_smem + kFlatsPerThreadBlock * kCtxSkTile;  // [128][kCtxSkTile]
 
     // one batch per block when flat tile does not cross Sq*H (true for H=128, tile=64)
     const int batch_idx = min(flat_base, max(flat_total - 1, 0)) / (sq * num_heads);
@@ -662,12 +740,12 @@ mla_ctx_smem_kernel(
 
     const int coop_stride = blockDim.x * blockDim.y;
 
-    float s[kScoreOutTile][kScoreOutTile];
+    acc_t s[kScoreOutTile][kScoreOutTile];
     #pragma unroll
     for (int di = 0; di < kScoreOutTile; ++di)
         #pragma unroll
         for (int dr = 0; dr < kScoreOutTile; ++dr)
-            s[di][dr] = 0.0f;
+            s[di][dr] = acc_t(0);
 
     int lf[kScoreOutTile], lr[kScoreOutTile];
     int flat[kScoreOutTile], r_idx[kScoreOutTile];
@@ -694,9 +772,9 @@ mla_ctx_smem_kernel(
     for (int dr = 0; dr < kScoreOutTile; ++dr)
         lr_m[dr] = lr[dr] & (kCtxSkTile - 1);
 
-    for (int k0 = 0; k0 < sk; k0 += kCtxSkTile) {
+    for (int k0 = k_begin; k0 < k_end; k0 += kCtxSkTile) {
         const int tile_len =
-            (k0 + kCtxSkTile <= sk) ? kCtxSkTile : (sk - k0);
+            (k0 + kCtxSkTile <= k_end) ? kCtxSkTile : (k_end - k0);
 
         // stage attn[flat, k0:k0+tile) — k contiguous → k_local = idx % tile_len
         const int attn_elems = kFlatsPerThreadBlock * tile_len;
@@ -719,17 +797,19 @@ mla_ctx_smem_kernel(
             const int r_s     = r0 + lr_s;
             if (k_local < tile_len && r_s < kv_rank)
                 ck_smem[lr_s * kCtxSkTile + (k_local ^ (lr_s & (kCtxSkTile - 1)))] =
-                    static_cast<float>(
+                    static_cast<acc_t>(
                         c_kv[ck_batch_stride + (k0 + k_local) * kv_rank + r_s]);
         }
         __syncthreads();
 
         // k-outer register strip: 4 attn + 4 ck SMEM loads feed 16 FMAs (0.5 loads/FMA).
         // Lanes past flat_total / kv_rank read unwritten SMEM; dropped at the store.
+        // Capped at 8: a full 64-wide unroll no longer fits the 64-register budget
+        // once the split-K bounds are live, and spills cost ~8x.
         if (tile_len == kCtxSkTile) {
-            #pragma unroll
+            #pragma unroll 8
             for (int k_local = 0; k_local < kCtxSkTile; ++k_local) {
-                float attn_reg[kScoreOutTile], ck_reg[kScoreOutTile];
+                acc_t attn_reg[kScoreOutTile], ck_reg[kScoreOutTile];
                 #pragma unroll
                 for (int di = 0; di < kScoreOutTile; ++di)
                     attn_reg[di] = attn_smem[lf[di] * kCtxSkTile + (k_local ^ lf_m[di])];
@@ -745,7 +825,7 @@ mla_ctx_smem_kernel(
         } else {
             // ragged final Sk tile: same body, runtime trip count
             for (int k_local = 0; k_local < tile_len; ++k_local) {
-                float attn_reg[kScoreOutTile], ck_reg[kScoreOutTile];
+                acc_t attn_reg[kScoreOutTile], ck_reg[kScoreOutTile];
                 #pragma unroll
                 for (int di = 0; di < kScoreOutTile; ++di)
                     attn_reg[di] = attn_smem[lf[di] * kCtxSkTile + (k_local ^ lf_m[di])];
@@ -762,13 +842,17 @@ mla_ctx_smem_kernel(
         __syncthreads();
     }
 
+    // Each grid.z slice owns a disjoint span of Sk, so the partials are a plain sum.
+    // Lanes of a warp differ in `flat`, so these hit distinct cache lines; the only
+    // contention is between the gridDim.z blocks sharing an output tile, and each of
+    // them contributes exactly one atomic per element after its whole reduction.
     #pragma unroll
     for (int di = 0; di < kScoreOutTile; ++di) {
         if (!valid_f[di]) continue;
         #pragma unroll
         for (int dr = 0; dr < kScoreOutTile; ++dr) {
             if (!valid_r[dr]) continue;
-            ctx[flat[di] * kv_rank + r_idx[dr]] = static_cast<scalar_t>(s[di][dr]);
+            ctx_store(&ctx[flat[di] * kv_rank + r_idx[dr]], s[di][dr], use_atomic);
         }
     }
 }
@@ -783,10 +867,10 @@ mla_ctx_smem_kernel(
 //   x indexes v_dim so a warp stores 32 contiguous floats of `out`
 //   SMEM [lb][r^lb] / [ld][r^ld] with col XOR swizzle (no padding), r staged fast
 //   Reduction is r-outer: 4 ctx + 4 w loads → 16 FMAs, so 0.5 SMEM loads per FMA
-template <typename scalar_t>
+template <typename scalar_t, typename ctx_t>
 __global__ void __launch_bounds__(kTileBlockThreads, kTileMinBlocksPerSM)
 mla_output_smem_kernel(
-    const scalar_t* __restrict__ ctx,   // [B, Sq, H, kv_rank]
+    const ctx_t*    __restrict__ ctx,   // [B, Sq, H, kv_rank]  dtype chosen by 3c
     const scalar_t* __restrict__ W_uv,  // [H, v_dim, kv_rank]
     scalar_t*       __restrict__ out,   // [B, Sq, H, v_dim]
     int bq_total,
@@ -794,25 +878,27 @@ mla_output_smem_kernel(
     int kv_rank,
     int v_dim)
 {
+    using acc_t = acc_t_of<scalar_t>;
+
     const int bq_base   = blockIdx.x * kOutBqTile;
     const int d_base    = blockIdx.y * kOutVTile;
     const int head_idx  = blockIdx.z;
 
-    extern __shared__ float smem[];
-    float* ctx_smem = smem;                                  // [64][kOutRTile]
-    float* w_smem   = ctx_smem + kOutBqTile * kOutRTile;     // [128][kOutRTile]
+    acc_t* smem     = dynamic_smem<acc_t>();
+    acc_t* ctx_smem = smem;                                  // [64][kOutRTile]
+    acc_t* w_smem   = ctx_smem + kOutBqTile * kOutRTile;     // [128][kOutRTile]
 
     // ctx[bq, h, r] and W_uv[h, d, r] are both contiguous in r
     const int ctx_head_base = head_idx * kv_rank;
     const int w_head_base   = head_idx * v_dim * kv_rank;
     const int coop_stride   = blockDim.x * blockDim.y;
 
-    float s[kScoreOutTile][kScoreOutTile];
+    acc_t s[kScoreOutTile][kScoreOutTile];
     #pragma unroll
     for (int db = 0; db < kScoreOutTile; ++db)
         #pragma unroll
         for (int dd = 0; dd < kScoreOutTile; ++dd)
-            s[db][dd] = 0.0f;
+            s[db][dd] = acc_t(0);
 
     int lb[kScoreOutTile], ld[kScoreOutTile];
     int bq[kScoreOutTile], d_idx[kScoreOutTile];
@@ -852,7 +938,7 @@ mla_output_smem_kernel(
             const int bq_s    = bq_base + lb_s;
             if (bq_s < bq_total)
                 ctx_smem[lb_s * kOutRTile + (r_local ^ (lb_s & (kOutRTile - 1)))] =
-                    static_cast<float>(
+                    static_cast<acc_t>(
                         ctx[(bq_s * num_heads) * kv_rank + ctx_head_base + r0 + r_local]);
         }
 
@@ -865,7 +951,7 @@ mla_output_smem_kernel(
             const int d_s     = d_base + ld_s;
             if (d_s < v_dim)
                 w_smem[ld_s * kOutRTile + (r_local ^ (ld_s & (kOutRTile - 1)))] =
-                    static_cast<float>(
+                    static_cast<acc_t>(
                         W_uv[w_head_base + d_s * kv_rank + r0 + r_local]);
         }
         __syncthreads();
@@ -875,7 +961,7 @@ mla_output_smem_kernel(
         if (tile_len == kOutRTile) {
             #pragma unroll 8
             for (int r_local = 0; r_local < kOutRTile; ++r_local) {
-                float ctx_reg[kScoreOutTile], w_reg[kScoreOutTile];
+                acc_t ctx_reg[kScoreOutTile], w_reg[kScoreOutTile];
                 #pragma unroll
                 for (int db = 0; db < kScoreOutTile; ++db)
                     ctx_reg[db] = ctx_smem[lb[db] * kOutRTile + (r_local ^ lb_m[db])];
@@ -891,7 +977,7 @@ mla_output_smem_kernel(
         } else {
             // ragged final kv_rank tile: same body, runtime trip count
             for (int r_local = 0; r_local < tile_len; ++r_local) {
-                float ctx_reg[kScoreOutTile], w_reg[kScoreOutTile];
+                acc_t ctx_reg[kScoreOutTile], w_reg[kScoreOutTile];
                 #pragma unroll
                 for (int db = 0; db < kScoreOutTile; ++db)
                     ctx_reg[db] = ctx_smem[lb[db] * kOutRTile + (r_local ^ lb_m[db])];
@@ -927,7 +1013,7 @@ torch::Tensor launch_mla_attention(
     torch::Tensor c_kv,        // [B, Sk, kv_rank]
     torch::Tensor pe_cache,    // [B, Sk, rope_dim]
     torch::Tensor W_uv,        // [H, v_dim, kv_rank]
-    float scale)
+    double scale)              // double so an fp64 request keeps an fp64 scale
 {
     int batch_size = q_absorbed.size(0), sq = q_absorbed.size(1);
     int num_heads  = q_absorbed.size(2), kv_rank = q_absorbed.size(3);
@@ -935,29 +1021,64 @@ torch::Tensor launch_mla_attention(
     int rope_dim   = q_rope.size(3);
     int v_dim      = W_uv.size(1);
 
+    const int flat_total = batch_size * sq * num_heads;
+
+    // Stage 3 stages, accumulates and stores intermediates in the accumulate dtype:
+    // fp64 in stays fp64 end to end, fp16 promotes to fp32 (see AccType).
+    const bool is_f64 = q_absorbed.scalar_type() == torch::kFloat64;
+    const auto acc_dtype = is_f64 ? torch::kFloat64 : torch::kFloat32;
+    const size_t acc_size = is_f64 ? sizeof(double) : sizeof(float);
+
+    // --- 3c split-K decision (needed up front: it picks the ctx dtype) ---------
+    // The 3c grid only parallelises the output dims (flat × kv_rank), so a
+    // single-stream decode (B=Sq=1 → 128 flats) yields just 2×4 = 8 blocks and leaves
+    // most SMs idle. Split Sk only when the output dims alone cannot fill the GPU;
+    // batched decode and prefill have flat_tiles in the hundreds or thousands and stay
+    // on split == 1, paying neither the pre-zero nor the atomics.
+    const int ctx_flat_tiles = (flat_total + kFlatsPerThreadBlock - 1) / kFlatsPerThreadBlock;
+    const int ctx_r_tiles    = (kv_rank    + kRsPerThreadBlock    - 1) / kRsPerThreadBlock;
+    const int ctx_sk_tiles   = (sk         + kCtxSkTile           - 1) / kCtxSkTile;
+
+    int ctx_split = (4 * sm_count()) / (ctx_flat_tiles * ctx_r_tiles);  // a few waves/SM
+    if (ctx_split < 1)            ctx_split = 1;
+    if (ctx_split > ctx_sk_tiles) ctx_split = ctx_sk_tiles;
+
+    // Give each slice a whole number of SMEM tiles, then recompute the split from that
+    // so no slice ends up empty (which would waste a block on nothing).
+    const int ctx_chunk_tiles = (ctx_sk_tiles + ctx_split - 1) / ctx_split;
+    ctx_split = (ctx_sk_tiles + ctx_chunk_tiles - 1) / ctx_chunk_tiles;
+    const int  ctx_sk_chunk = ctx_chunk_tiles * kCtxSkTile;
+    const bool ctx_atomic   = ctx_split > 1;
+
     auto scores = torch::empty({batch_size, sq, num_heads, sk},
-                               torch::TensorOptions().dtype(torch::kFloat32)
-                                                     .device(q_absorbed.device()));  // [B,Sq,128,Sk]
-    auto ctx = torch::empty({batch_size, sq, num_heads, kv_rank}, q_absorbed.options());  // [B,Sq,128,512]
+                               q_absorbed.options().dtype(acc_dtype));  // [B,Sq,128,Sk]
+    // ctx keeps the input dtype; only split-K promotes it to the accumulate dtype, since
+    // combining the partials means read-modify-write via atomicAdd.
+    auto ctx = torch::empty({batch_size, sq, num_heads, kv_rank},
+                            ctx_atomic ? q_absorbed.options().dtype(acc_dtype)
+                                       : q_absorbed.options());                        // [B,Sq,128,512]
     auto out = torch::empty({batch_size, sq, num_heads, v_dim}, q_absorbed.options());     // [B,Sq,128,128]
 
     // 3a: grid.x=flat(B*Sq*H), grid.y=Sk; 16×32 threads → 64×128 scores/block;
     //     kv_rank reduction iterated in SMEM tiles of kKvRankTile=64
     {
-        const int flat_total = batch_size * sq * num_heads;
         dim3 threads(kScoreThreadsX, kScoreThreadsY);  // 16×32 = 512 threads
         dim3 blocks(
             (flat_total + kFlatsPerThreadBlock - 1) / kFlatsPerThreadBlock,
             (sk         + kKsPerThreadBlock    - 1) / kKsPerThreadBlock);
-        // SMEM: qa[64][64] + ck[128][64] floats with XOR col swizzle (qr/pe reuse)
+        // SMEM: qa[64][64] + ck[128][64] acc_t with XOR col swizzle (qr/pe reuse)
         size_t smem = static_cast<size_t>(
-            kFlatsPerThreadBlock * kKvRankTile + kKsPerThreadBlock * kKvRankTile) * sizeof(float);
+            kFlatsPerThreadBlock * kKvRankTile + kKsPerThreadBlock * kKvRankTile) * acc_size;
         AT_DISPATCH_FLOATING_TYPES_AND_HALF(q_absorbed.scalar_type(), "mla_scores", ([&] {
-            mla_scores_kernel<scalar_t><<<blocks, threads, smem>>>(
+            using acc_t = acc_t_of<scalar_t>;
+            auto kernel = mla_scores_kernel<scalar_t>;
+            enable_large_smem(kernel, smem);  // fp64 tiles exceed the default 48 KB
+            kernel<<<blocks, threads, smem>>>(
                 q_absorbed.data_ptr<scalar_t>(), q_rope.data_ptr<scalar_t>(),
                 c_kv.data_ptr<scalar_t>(),       pe_cache.data_ptr<scalar_t>(),
-                scores.data_ptr<float>(),
-                batch_size, sq, sk, num_heads, kv_rank, rope_dim, scale);
+                scores.data_ptr<acc_t>(),
+                batch_size, sq, sk, num_heads, kv_rank, rope_dim,
+                static_cast<acc_t>(scale));
         }));
         cudaDeviceSynchronize();
     }
@@ -965,27 +1086,42 @@ torch::Tensor launch_mla_attention(
     // 3b: softmax in-place on scores → attn [B,Sq,128,Sk]
     {
         dim3 blocks(batch_size * sq, num_heads);
-        naive_softmax_kernel<<<blocks, kBlockThreads>>>(
-            scores.data_ptr<float>(), batch_size, sq, num_heads, sk);
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(q_absorbed.scalar_type(), "mla_softmax", ([&] {
+            using acc_t = acc_t_of<scalar_t>;
+            naive_softmax_kernel<acc_t><<<blocks, kBlockThreads>>>(
+                scores.data_ptr<acc_t>(), batch_size, sq, num_heads, sk);
+        }));
         cudaDeviceSynchronize();
     }
 
-    // 3c: grid.x=flat(B*Sq*H), grid.y=kv_rank; 16×32 → 64×128 ctx/block;
-    //     Sk reduction in SMEM tiles of kCtxSkTile=64 (same tiling style as 3a)
+    // 3c: grid.x=flat(B*Sq*H), grid.y=kv_rank, grid.z=split-K slice over Sk;
+    //     16×32 → 64×128 ctx/block; Sk reduced in SMEM tiles of kCtxSkTile=64
     {
-        const int flat_total = batch_size * sq * num_heads;
+        // atomicAdd accumulates, so the partials need a zeroed destination
+        if (ctx_atomic) ctx.zero_();
+
         dim3 threads(kScoreThreadsX, kScoreThreadsY);  // 16×32 = 512 threads
-        dim3 blocks(
-            (flat_total + kFlatsPerThreadBlock - 1) / kFlatsPerThreadBlock,
-            (kv_rank    + kRsPerThreadBlock    - 1) / kRsPerThreadBlock);
-        // SMEM: attn[64][64] + ck[128][64] floats with XOR col swizzle
+        dim3 blocks(ctx_flat_tiles, ctx_r_tiles, ctx_split);
+        // SMEM: attn[64][64] + ck[128][64] acc_t with XOR col swizzle
         size_t smem = static_cast<size_t>(
-            kFlatsPerThreadBlock * kCtxSkTile + kRsPerThreadBlock * kCtxSkTile) * sizeof(float);
+            kFlatsPerThreadBlock * kCtxSkTile + kRsPerThreadBlock * kCtxSkTile) * acc_size;
         AT_DISPATCH_FLOATING_TYPES_AND_HALF(q_absorbed.scalar_type(), "mla_ctx", ([&] {
-            mla_ctx_smem_kernel<scalar_t><<<blocks, threads, smem>>>(
-                scores.data_ptr<float>(), c_kv.data_ptr<scalar_t>(),
-                ctx.data_ptr<scalar_t>(),
-                batch_size, sq, sk, num_heads, kv_rank);
+            using acc_t = acc_t_of<scalar_t>;
+            if (ctx_atomic) {
+                auto kernel = mla_ctx_kernel<scalar_t, acc_t>;
+                enable_large_smem(kernel, smem);
+                kernel<<<blocks, threads, smem>>>(
+                    scores.data_ptr<acc_t>(), c_kv.data_ptr<scalar_t>(),
+                    ctx.data_ptr<acc_t>(),
+                    batch_size, sq, sk, num_heads, kv_rank, ctx_sk_chunk, true);
+            } else {
+                auto kernel = mla_ctx_kernel<scalar_t, scalar_t>;
+                enable_large_smem(kernel, smem);
+                kernel<<<blocks, threads, smem>>>(
+                    scores.data_ptr<acc_t>(), c_kv.data_ptr<scalar_t>(),
+                    ctx.data_ptr<scalar_t>(),
+                    batch_size, sq, sk, num_heads, kv_rank, ctx_sk_chunk, false);
+            }
         }));
         cudaDeviceSynchronize();
     }
@@ -999,14 +1135,26 @@ torch::Tensor launch_mla_attention(
             (bq_total + kOutBqTile - 1) / kOutBqTile,
             (v_dim    + kOutVTile  - 1) / kOutVTile,
             num_heads);
-        // SMEM: ctx[64][64] + w[128][64] floats with XOR col swizzle
+        // SMEM: ctx[64][64] + w[128][64] acc_t with XOR col swizzle
         size_t smem = static_cast<size_t>(
-            kOutBqTile * kOutRTile + kOutVTile * kOutRTile) * sizeof(float);
+            kOutBqTile * kOutRTile + kOutVTile * kOutRTile) * acc_size;
         AT_DISPATCH_FLOATING_TYPES_AND_HALF(q_absorbed.scalar_type(), "mla_output", ([&] {
-            mla_output_smem_kernel<scalar_t><<<blocks, threads, smem>>>(
-                ctx.data_ptr<scalar_t>(), W_uv.data_ptr<scalar_t>(),
-                out.data_ptr<scalar_t>(),
-                bq_total, num_heads, kv_rank, v_dim);
+            using acc_t = acc_t_of<scalar_t>;
+            if (ctx_atomic) {  // 3c promoted ctx to the accumulate dtype for the atomics
+                auto kernel = mla_output_smem_kernel<scalar_t, acc_t>;
+                enable_large_smem(kernel, smem);
+                kernel<<<blocks, threads, smem>>>(
+                    ctx.data_ptr<acc_t>(), W_uv.data_ptr<scalar_t>(),
+                    out.data_ptr<scalar_t>(),
+                    bq_total, num_heads, kv_rank, v_dim);
+            } else {
+                auto kernel = mla_output_smem_kernel<scalar_t, scalar_t>;
+                enable_large_smem(kernel, smem);
+                kernel<<<blocks, threads, smem>>>(
+                    ctx.data_ptr<scalar_t>(), W_uv.data_ptr<scalar_t>(),
+                    out.data_ptr<scalar_t>(),
+                    bq_total, num_heads, kv_rank, v_dim);
+            }
         }));
         cudaDeviceSynchronize();
     }
