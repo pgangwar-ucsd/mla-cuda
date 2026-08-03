@@ -1,4 +1,4 @@
-# mla-fused
+# Multi-head Latent Attention CUDA Kernel
 
 Hand-written CUDA kernels for DeepSeek-V3's **Multi-head Latent Attention (MLA)**,
 absorbed-inference path, benchmarked against a PyTorch reference implementation.
