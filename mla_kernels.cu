@@ -22,7 +22,7 @@
 // row index by anything else only works while the two tiles happen to be equal.
 //
 //   kernel                 output tiles                     reduction tile
-//   2ac q_raw_gemm         kQBqTile   x kQWqColTile          kQHiddenTile
+//   2a q_raw_gemm         kQBqTile   x kQWqColTile          kQHiddenTile
 //   2b  q_absorb           kQBqTile   x kQRankTile           kQNopeTile
 //   3a  mla_scores         kFlatTile  x kScoreSkTile         kScoreRankTile
 //   3c  mla_ctx            kFlatTile  x kCtxRankTile         kCtxSkTile
@@ -42,10 +42,10 @@ static constexpr int kRopeDim        = 64;  // qk_rope_head_dim (compile-time fo
 // head h's 5.5 MB W_q panel once per (b,s), i.e. 90 GB at B=128.
 static constexpr int kQThreadsX   = 32;  // 32×4 = 128 outputs along the contiguous dim
 static constexpr int kQThreadsY   = 16;  // 16×4 = 64 bq per block
-static constexpr int kQBqTile     = kQThreadsY * kRegTile;  // 64 bq out (2ac and 2b)
-static constexpr int kQWqColTile  = kQThreadsX * kRegTile;  // 128 W_q columns out (2ac)
+static constexpr int kQBqTile     = kQThreadsY * kRegTile;  // 64 bq out (2a and 2b)
+static constexpr int kQWqColTile  = kQThreadsX * kRegTile;  // 128 W_q columns out (2a)
 static constexpr int kQRankTile   = kQThreadsX * kRegTile;  // 128 kv_rank out (2b)
-static constexpr int kQHiddenTile = 64;  // reduce over hidden   (2ac)
+static constexpr int kQHiddenTile = 64;  // reduce over hidden   (2a)
 static constexpr int kQNopeTile   = 64;  // reduce over nope_dim (2b)
 static constexpr int kRopeThreads = 256;
 // 3b: many rows → small blocks maximise SMs busy; few rows → wide blocks so a
@@ -121,13 +121,16 @@ static int sm_count() {
 //  2c.  absorb the nope half against W_uk[h]      → Q_absorbed [B,Sq,H,512]
 //
 
-// --- 2a. q_raw = x @ W_q: 4×4 tile/thread; grid (W_q col tiles, bq tiles) ---
+// --- 2a. q_raw = x @ W_q: kBqReg×4 tile/thread; grid (W_q col tiles, bq tiles) ---
 //   grid.x: n ∈ [0, H*qk_head_dim)   — 128 columns per block (contiguous in q_raw)
-//   grid.y: bq = b*Sq + s            — 64 bq per block
-//   block: 32×16 → each thread 4 cols × 4 bq; hidden reduced in SMEM tiles of 64
+//   grid.y: bq = b*Sq + s            — kQThreadsY*kBqReg per block
+//   block: 32×16 → each thread 4 cols × kBqReg bq; hidden reduced in SMEM tiles of 64
 //   SMEM [lb][k^lb] / [ln][k^ln] with col XOR swizzle; k staged fast for coalescing
-//   Reduction is k-outer: 4 x + 4 w loads → 16 FMAs, so 0.5 SMEM loads per FMA
-template <typename scalar_t>
+//
+//   kBqReg is the only knob: 4 gives the usual 64-row tile (4 x + 4 w loads → 16 FMAs,
+//   0.5 SMEM loads per FMA). Single-stream decode has bq_total == 1, where a 64-row
+//   tile spends 63/64 of its FMAs on rows the epilogue discards
+template <typename scalar_t, int kBqReg>
 __global__ void __launch_bounds__(kTileBlockThreads, kTileMinBlocksPerSM)
 q_raw_gemm_kernel(
     const scalar_t* __restrict__ x,      // [B*Sq, hidden]
@@ -138,28 +141,29 @@ q_raw_gemm_kernel(
     int n_total)
 {
     using acc_t = acc_t_of<scalar_t>;
+    constexpr int kBqTile = kQThreadsY * kBqReg;  // bq rows this block owns
 
     const int n_base  = blockIdx.x * kQWqColTile;
-    const int bq_base = blockIdx.y * kQBqTile;
+    const int bq_base = blockIdx.y * kBqTile;
 
     acc_t* smem   = dynamic_smem<acc_t>();
-    acc_t* x_smem = smem;                             // [kQBqTile][kQHiddenTile]
-    acc_t* w_smem = x_smem + kQBqTile * kQHiddenTile; // [kQWqColTile][kQHiddenTile]
+    acc_t* x_smem = smem;                           // [kBqTile][kQHiddenTile]
+    acc_t* w_smem = x_smem + kBqTile * kQHiddenTile; // [kQWqColTile][kQHiddenTile]
 
     const int coop_stride = blockDim.x * blockDim.y;
 
-    acc_t s[kRegTile][kRegTile];
+    acc_t s[kBqReg][kRegTile];
     #pragma unroll
-    for (int db = 0; db < kRegTile; ++db)
+    for (int db = 0; db < kBqReg; ++db)
         #pragma unroll
         for (int dn = 0; dn < kRegTile; ++dn)
             s[db][dn] = acc_t(0);
 
     // threadIdx.y → bq (the row), threadIdx.x → n (contiguous in q_raw): a warp
-    int lb[kRegTile], ln[kRegTile];
+    int lb[kBqReg], ln[kRegTile];
     #pragma unroll
-    for (int db = 0; db < kRegTile; ++db)
-        lb[db] = threadIdx.y * kRegTile + db;
+    for (int db = 0; db < kBqReg; ++db)
+        lb[db] = threadIdx.y * kBqReg + db;
     #pragma unroll
     for (int dn = 0; dn < kRegTile; ++dn)
         ln[dn] = threadIdx.x + dn * blockDim.x;
@@ -168,12 +172,12 @@ q_raw_gemm_kernel(
     // kQHiddenTile for x_smem and w_smem alike, since that is the inner extent of both. The
     // swizzle has to permute within one row, which requires mask < row width. Do not
     // simplify the bq side to a bare lb[]: that is only equivalent while
-    // kQBqTile <= kQHiddenTile, and would silently spill into the next row if the two tiles
+    // kBqTile <= kQHiddenTile, and would silently spill into the next row if the two tiles
     // were ever retuned apart.
     // Bitwise ANDing a number with 63 is a lightning-fast way of calculating modulo 64
-    int lb_m[kRegTile], ln_m[kRegTile];
+    int lb_m[kBqReg], ln_m[kRegTile];
     #pragma unroll
-    for (int db = 0; db < kRegTile; ++db)
+    for (int db = 0; db < kBqReg; ++db)
         lb_m[db] = lb[db] & (kQHiddenTile - 1);
     #pragma unroll
     for (int dn = 0; dn < kRegTile; ++dn)
@@ -183,8 +187,8 @@ q_raw_gemm_kernel(
         const int tile_len =
             (k0 + kQHiddenTile <= hidden_dim) ? kQHiddenTile : (hidden_dim - k0);
 
-        // stage x[bq_base:+64, k0:+tile) — k contiguous → k_local = idx % tile_len
-        const int x_elems = kQBqTile * tile_len;
+        // stage x[bq_base:+kBqTile, k0:+tile) — k contiguous → k_local = idx % tile_len
+        const int x_elems = kBqTile * tile_len;
         for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
              idx < x_elems; idx += coop_stride) {
             const int lb_s    = idx / tile_len;
@@ -213,15 +217,15 @@ q_raw_gemm_kernel(
         if (tile_len == kQHiddenTile) {
             #pragma unroll 8
             for (int k_local = 0; k_local < kQHiddenTile; ++k_local) {
-                acc_t x_reg[kRegTile], w_reg[kRegTile];
+                acc_t x_reg[kBqReg], w_reg[kRegTile];
                 #pragma unroll
-                for (int db = 0; db < kRegTile; ++db)
+                for (int db = 0; db < kBqReg; ++db)
                     x_reg[db] = x_smem[lb[db] * kQHiddenTile + (k_local ^ lb_m[db])];
                 #pragma unroll
                 for (int dn = 0; dn < kRegTile; ++dn)
                     w_reg[dn] = w_smem[ln[dn] * kQHiddenTile + (k_local ^ ln_m[dn])];
                 #pragma unroll
-                for (int db = 0; db < kRegTile; ++db)
+                for (int db = 0; db < kBqReg; ++db)
                     #pragma unroll
                     for (int dn = 0; dn < kRegTile; ++dn)
                         s[db][dn] += x_reg[db] * w_reg[dn];
@@ -229,15 +233,15 @@ q_raw_gemm_kernel(
         } else {
             // ragged final hidden tile: same body, runtime trip count
             for (int k_local = 0; k_local < tile_len; ++k_local) {
-                acc_t x_reg[kRegTile], w_reg[kRegTile];
+                acc_t x_reg[kBqReg], w_reg[kRegTile];
                 #pragma unroll
-                for (int db = 0; db < kRegTile; ++db)
+                for (int db = 0; db < kBqReg; ++db)
                     x_reg[db] = x_smem[lb[db] * kQHiddenTile + (k_local ^ lb_m[db])];
                 #pragma unroll
                 for (int dn = 0; dn < kRegTile; ++dn)
                     w_reg[dn] = w_smem[ln[dn] * kQHiddenTile + (k_local ^ ln_m[dn])];
                 #pragma unroll
-                for (int db = 0; db < kRegTile; ++db)
+                for (int db = 0; db < kBqReg; ++db)
                     #pragma unroll
                     for (int dn = 0; dn < kRegTile; ++dn)
                         s[db][dn] += x_reg[db] * w_reg[dn];
@@ -247,7 +251,7 @@ q_raw_gemm_kernel(
     }
 
     #pragma unroll
-    for (int db = 0; db < kRegTile; ++db) {
+    for (int db = 0; db < kBqReg; ++db) {
         const int bq_i = bq_base + lb[db];
         if (bq_i >= bq_total) continue;
         const int row_base = bq_i * n_total;
@@ -356,7 +360,7 @@ q_absorb_kernel(
     for (int dr = 0; dr < kRegTile; ++dr)
         lr[dr] = threadIdx.x + dr * blockDim.x;
 
-    // Both masked by kQNopeTile — the row width of qn_smem and w_smem alike (see 2ac).
+    // Both masked by kQNopeTile — the row width of qn_smem and w_smem alike (see 2a).
     int lb_m[kRegTile], lr_m[kRegTile];
     #pragma unroll
     for (int db = 0; db < kRegTile; ++db)
@@ -482,22 +486,34 @@ std::vector<torch::Tensor> launch_q_absorbed(
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    // 2a: grid.x=W_q col tiles, grid.y=bq tiles; 32×16 threads → 64 bq × 128 cols
+    // 2a: grid.x=W_q col tiles, grid.y=bq tiles; 32×16 threads → kBqTile bq × 128 cols
     {
         dim3 threads(kQThreadsX, kQThreadsY);  // 32×16 = 512 threads
-        dim3 blocks((n_total  + kQWqColTile  - 1) / kQWqColTile,
-                    (bq_total + kQBqTile - 1) / kQBqTile);
-        // SMEM: x[64][64] + w[128][64] acc_t with XOR col swizzle
-        size_t smem = static_cast<size_t>(
-            kQBqTile * kQHiddenTile + kQWqColTile * kQHiddenTile) * acc_size;
         AT_DISPATCH_FLOATING_TYPES_AND_HALF(xc.scalar_type(), "q_raw_gemm", ([&] {
             using acc_t = acc_t_of<scalar_t>;
-            auto kernel = q_raw_gemm_kernel<scalar_t>;
-            enable_large_smem(kernel, smem);  // fp64 tiles exceed the default 48 KB
-            kernel<<<blocks, threads, smem, stream>>>(
-                xc.data_ptr<scalar_t>(), W_qc.data_ptr<scalar_t>(),
-                q_raw.data_ptr<acc_t>(),
-                bq_total, hidden_dim, n_total);
+            auto launch = [&](auto kernel, int bq_tile) {
+                dim3 blocks((n_total  + kQWqColTile - 1) / kQWqColTile,
+                            (bq_total + bq_tile     - 1) / bq_tile);
+                // SMEM: x[bq_tile][64] + w[128][64] acc_t with XOR col swizzle
+                size_t smem = static_cast<size_t>(
+                    bq_tile + kQWqColTile) * kQHiddenTile * acc_size;
+                enable_large_smem(kernel, smem);  // fp64 tiles exceed the default 48 KB
+                kernel<<<blocks, threads, smem, stream>>>(
+                    xc.data_ptr<scalar_t>(), W_qc.data_ptr<scalar_t>(),
+                    q_raw.data_ptr<acc_t>(),
+                    bq_total, hidden_dim, n_total);
+            };
+            // Pick the narrowest bq tile that does not add a W_q pass. Every bq tile
+            // re-streams the whole W_q, so halving the tile only pays while
+            // it leaves ceil(bq_total / tile) unchanged — true up to 32 rows, not past
+            // it. At bq_total=33 a 32-row tile would compute the same 64 rows over two
+            // passes instead of one, trading no arithmetic for extra traffic.
+            if (bq_total <= 1 * kQThreadsY)
+                launch(q_raw_gemm_kernel<scalar_t, 1>,        1 * kQThreadsY);
+            else if (bq_total <= 2 * kQThreadsY)
+                launch(q_raw_gemm_kernel<scalar_t, 2>,        2 * kQThreadsY);
+            else
+                launch(q_raw_gemm_kernel<scalar_t, kRegTile>, kQBqTile);
         }));
     }
 
