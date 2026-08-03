@@ -300,10 +300,15 @@ def mla_attention_official(q_absorbed, q_rope, c_kv, pe_cache, W_uv, cfg: DeepSe
 # CUDA fused versions of Q-prep and attention
 # ---------------------------------------------------------------------------
 
-def prepare_q_mla_absorbed_cuda(x, W_q, W_uk, cfg: DeepSeekV3Config):
-    """Kernel 2: x[B,Sq,7168] → Q_absorbed[B,Sq,128,512], Q_rope[B,Sq,128,64]."""
+def prepare_q_mla_absorbed_cuda(x, W_q, W_uk, q_positions, cfg: DeepSeekV3Config):
+    """Kernel 2: x[B,Sq,7168] → Q_absorbed[B,Sq,128,512], Q_rope[B,Sq,128,64].
+
+    q_positions [Sq] holds the absolute position of each query and is required: in
+    decode Sq == 1 while the query sits at the end of the KV cache, so the kernel
+    cannot derive it from the shape.
+    """
     q_absorbed, q_rope = mla_custom_cuda.q_absorbed(
-        x, W_q.contiguous(), W_uk.contiguous(),
+        x, W_q.contiguous(), W_uk.contiguous(), q_positions,
         cfg.qk_nope_head_dim, cfg.qk_rope_head_dim,
     )
     return q_absorbed, q_rope  # [B,Sq,128,512], [B,Sq,128,64]
@@ -352,7 +357,12 @@ def make_mla_tensors(scenario: BenchmarkScenario, cfg: DeepSeekV3Config, dtype=t
     )
     wkv_b = wkv_b * (1.0 / cfg.qk_nope_head_dim ** 0.5)
 
-    q_positions = torch.arange(sq, device=device)
+    # The query tokens are the *newest* Sq entries of a cache holding Sk of them, so
+    # they sit at absolute positions [Sk-Sq, Sk). For prefill (Sq == Sk) this is the
+    # usual arange(Sq); for decode it is what makes the scenario real. arange(Sq) would
+    # place a decode query at position 0, where the RoPE angle is 0 and the rotation
+    # degenerates to the identity — the decode rows would never exercise RoPE at all.
+    q_positions = torch.arange(sk - sq, sk, device=device)
     return x, c_kv, pe_cache, W_q, wkv_b, q_positions
 
 
@@ -362,17 +372,10 @@ def baseline_official_mla_attention(x, c_kv, pe_cache, W_q, wkv_b, q_positions, 
     return mla_attention_official(q_absorbed, q_rope, c_kv, pe_cache, W_uv, cfg)
 
 
-def cuda_attention_mla_attention(x, c_kv, pe_cache, W_q, wkv_b, q_positions, cfg):
-    """PyTorch Q-prep + CUDA attention (official layout)."""
-    W_uk, W_uv = split_wkv_b(wkv_b, cfg)
-    q_absorbed, q_rope = prepare_q_mla_absorbed(x, W_q, W_uk, q_positions, cfg)
-    return mla_attention_official_cuda(q_absorbed, q_rope, c_kv, pe_cache, W_uv, cfg)
-
-
 def cuda_fully_fused_mla_attention(x, c_kv, pe_cache, W_q, wkv_b, q_positions, cfg):
     """Fused CUDA Q-prep (kernel 2) + CUDA attention (kernel 3)."""
     W_uk, W_uv = split_wkv_b(wkv_b, cfg)
-    q_absorbed, q_rope = prepare_q_mla_absorbed_cuda(x, W_q, W_uk, cfg)
+    q_absorbed, q_rope = prepare_q_mla_absorbed_cuda(x, W_q, W_uk, q_positions, cfg)
     return mla_attention_official_cuda(q_absorbed, q_rope, c_kv, pe_cache, W_uv, cfg)
 
 
@@ -404,20 +407,17 @@ class BenchmarkResult:
     sq: int
     sk: int
     baseline_ms: float
-    fused_ms: float          # CUDA attention (+ PyTorch Q)
-    speedup: float           # baseline / fused_ms
+    fused_ms: float    # CUDA fully-fused (Q-prep + attention)
+    speedup: float     # baseline / fused_ms
     passed: bool
     skipped: bool = False
     skip_reason: str = ""
-    full_ms: float = float("nan")       # CUDA fully-fused (Q-prep + attn)
-    full_speedup: float = float("nan")  # baseline / full_ms
 
 
 def run_scenario(
     scenario: BenchmarkScenario,
     cfg: DeepSeekV3Config,
     dtype=torch.float32,
-    cuda_attn_only: bool = False,
 ) -> BenchmarkResult:
     header = (
         f"\n{'-' * 78}\n"
@@ -446,52 +446,28 @@ def run_scenario(
     common = (x, c_kv, pe_cache, W_q, wkv_b, q_positions, cfg)
 
     try:
-        mode = "CUDA attention only" if cuda_attn_only else "full"
-        print(f"  Correctness check ({mode})...")
+        print("  Correctness check...")
         base_out = baseline_official_mla_attention(*common)
-        cuda_out = cuda_attention_mla_attention(*common)
+        fused_out = cuda_fully_fused_mla_attention(*common)
 
         tol = dict(rtol=3e-2, atol=3e-2)
         # Long Sk: hand-written fp32 reductions disagree with cuBLAS einsum by more
         # than a flat 3e-2 abs tol (same order as fp32 vs fp64 for this op).
         if scenario.sk > 2048:
             tol = dict(rtol=5e-2, atol=max(3e-2, 3e-5 * scenario.sk))
-        cuda_ok = torch.allclose(base_out, cuda_out, **tol)
-        diff_cuda = torch.max(torch.abs(base_out - cuda_out)).item()
+        fused_ok = torch.allclose(base_out, fused_out, **tol)
+        diff_fused = torch.max(torch.abs(base_out - fused_out)).item()
 
-        print(f"  CUDA attention vs baseline:  {'PASS' if cuda_ok else 'FAIL'} (max diff {diff_cuda:.6f})")
+        print(f"  CUDA fully-fused vs baseline:  {'PASS' if fused_ok else 'FAIL'} (max diff {diff_fused:.6f})")
 
-        full_ok = True
-        if not cuda_attn_only:
-            full_out = cuda_fully_fused_mla_attention(*common)
-            full_ok = torch.allclose(base_out, full_out, **tol)
-            diff_full = torch.max(torch.abs(base_out - full_out)).item()
-            print(f"  CUDA fully-fused vs baseline:  {'PASS' if full_ok else 'FAIL'} (max diff {diff_full:.6f})")
-
-        if not cuda_ok:
+        if not fused_ok:
             return BenchmarkResult(
                 scenario.name, scenario.phase, scenario.batch, scenario.sq, scenario.sk,
                 0, 0, 0, False)
 
-        if not cuda_attn_only and not full_ok:
-            return BenchmarkResult(
-                scenario.name, scenario.phase, scenario.batch, scenario.sq, scenario.sk,
-                0, 0, 0, False)
-
-        bench_label = (
-            "PyTorch baseline vs CUDA attention (+ PyTorch Q)"
-            if cuda_attn_only
-            else "end-to-end MLA attention"
-        )
-        print(f"  Benchmarking {bench_label}...")
+        print("  Benchmarking end-to-end MLA attention...")
         base_time = benchmark(baseline_official_mla_attention, *common, num_iters=scenario.num_iters)
-        cuda_time = benchmark(cuda_attention_mla_attention, *common, num_iters=scenario.num_iters)
-        if cuda_attn_only:
-            full_time = float("nan")
-        elif full_ok:
-            full_time = benchmark(cuda_fully_fused_mla_attention, *common, num_iters=scenario.num_iters)
-        else:
-            full_time = float("nan")
+        fused_time = benchmark(cuda_fully_fused_mla_attention, *common, num_iters=scenario.num_iters)
 
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
@@ -502,21 +478,13 @@ def run_scenario(
             0, 0, 0, False, skipped=True, skip_reason=reason,
         )
 
-    speedup_cuda = base_time / cuda_time
-    speedup_full = (
-        base_time / full_time
-        if (not cuda_attn_only and full_ok and full_time == full_time)
-        else float("nan")
-    )
-    print(f"  PyTorch baseline:             {base_time:.4f} ms")
-    print(f"  CUDA attention (+ PyTorch Q): {cuda_time:.4f} ms  ({speedup_cuda:.2f}x)")
-    if not cuda_attn_only:
-        print(f"  CUDA fully-fused:             {full_time:.4f} ms  ({speedup_full:.2f}x)")
+    speedup = base_time / fused_time
+    print(f"  PyTorch baseline:  {base_time:.4f} ms")
+    print(f"  CUDA fully-fused:  {fused_time:.4f} ms  ({speedup:.2f}x)")
 
     return BenchmarkResult(
         scenario.name, scenario.phase, scenario.batch, scenario.sq, scenario.sk,
-        base_time, cuda_time, speedup_cuda, True,
-        full_ms=full_time, full_speedup=speedup_full,
+        base_time, fused_time, speedup, True,
     )
 
 
@@ -530,39 +498,28 @@ def print_summary(results: List[BenchmarkResult], cfg: DeepSeekV3Config) -> None
         f"qk=[{cfg.qk_nope_head_dim}+{cfg.qk_rope_head_dim}]  v={cfg.v_head_dim}  "
         f"Q_final={cfg.q_absorbed_dim}"
     )
-    print(
-        "  CUDA ms = attention only (+ PyTorch Q)   "
-        "Fused CUDA ms = fully-fused (Q-prep + attention)"
-    )
-    print("-" * 110)
+    print("  Fused ms = fully-fused CUDA (Q-prep + attention)")
+    print("-" * 78)
     print(
         f"{'Scenario':<32} {'Phase':<8} {'B':>4} {'Sq':>6} {'Sk':>7} "
-        f"{'Base ms':>9} {'CUDA ms':>9} {'Fused CUDA ms':>14} "
-        f"{'CUDA Spd':>9} {'Fused CUDA Spd':>14}"
+        f"{'Base ms':>9} {'Fused ms':>9} {'Speedup':>9}"
     )
-    print("-" * 110)
-
-    def _fmt_ms(v: float, width: int = 9) -> str:
-        return f"{v:>{width}.2f}" if v == v else f"{'—':>{width}}"
-
-    def _fmt_spd(v: float, width: int = 9) -> str:
-        return f"{v:>{width - 1}.2f}x" if v == v else f"{'—':>{width}}"
+    print("-" * 78)
 
     for r in results:
         if r.skipped:
             reason = f" ({r.skip_reason})" if r.skip_reason else ""
             print(
                 f"{r.scenario:<32} {r.phase:<8} {r.batch:>4} {r.sq:>6} {r.sk:>7} "
-                f"{'SKIP':>9} {'SKIP':>9} {'SKIP':>14} {'—':>9} {'—':>14}{reason}"
+                f"{'SKIP':>9} {'SKIP':>9} {'—':>9}{reason}"
             )
             continue
         status = "ok" if r.passed else "FAIL"
         print(
             f"{r.scenario:<32} {r.phase:<8} {r.batch:>4} {r.sq:>6} {r.sk:>7} "
-            f"{r.baseline_ms:>9.2f} {r.fused_ms:>9.2f} {_fmt_ms(r.full_ms, 14)} "
-            f"{_fmt_spd(r.speedup, 9)} {_fmt_spd(r.full_speedup, 14)}  [{status}]"
+            f"{r.baseline_ms:>9.2f} {r.fused_ms:>9.2f} {r.speedup:>8.2f}x  [{status}]"
         )
-    print("=" * 110)
+    print("=" * 78)
 
 
 def _resolve_scenario_names(args: argparse.Namespace) -> List[str]:
@@ -596,11 +553,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "Run decode_single_64k_cache and decode_production_avg_cache only "
             "(long-cache decode targets)"
         ),
-    )
-    parser.add_argument(
-        "--cuda-attn-only",
-        action="store_true",
-        help="Compare PyTorch baseline vs CUDA attention only; skip fully-fused Q+attn path",
     )
     parser.add_argument(
         "--include-large",
@@ -675,14 +627,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
 
     scenarios = select_scenarios(args)
-    mode_bits = []
-    if args.cuda_attn_only:
-        mode_bits.append("CUDA attention only")
-    print(f"  Running {len(scenarios)} scenario(s)" + (f" ({', '.join(mode_bits)})" if mode_bits else "") + "...")
+    print(f"  Running {len(scenarios)} scenario(s)...")
 
     results: List[BenchmarkResult] = []
     for scenario in scenarios:
-        results.append(run_scenario(scenario, cfg, cuda_attn_only=args.cuda_attn_only))
+        results.append(run_scenario(scenario, cfg))
 
     print_summary(results, cfg)
 

@@ -15,7 +15,6 @@ import mla_custom_cuda
 from exhaustive_benchmark_suite import (
     DEEPSEEK_V3,
     PRODUCTION_SCENARIOS,
-    apply_rope,
     make_mla_tensors,
     mla_attention_official,
     mla_attention_official_cuda,
@@ -51,8 +50,7 @@ def profile(scenario, cfg):
     nope = cfg.qk_nope_head_dim
 
     W_uk, W_uv = split_wkv_b(wkv_b, cfg)
-    W_uk_c, W_uv_c = W_uk.contiguous(), W_uv.contiguous()
-    qa, qr = prepare_q_mla_absorbed_cuda(x, W_q, W_uk, cfg)
+    qa, qr = prepare_q_mla_absorbed_cuda(x, W_q, W_uk, q_positions, cfg)
 
     print(f"\n{'=' * 78}\n{scenario.name}  B={B} Sq={Sq} Sk={Sk}\n{'=' * 78}")
 
@@ -65,40 +63,23 @@ def profile(scenario, cfg):
           f"({wt_mb:.0f} MB copied per call)")
 
     # ---- stage 2: Q-prep ----
-    t_q_cuda = time_ms(lambda: prepare_q_mla_absorbed_cuda(x, W_q, W_uk, cfg))
-    t_q_cuda_pre = time_ms(lambda: prepare_q_mla_absorbed_cuda(x, W_q, W_uk_c, cfg))
+    t_q_cuda = time_ms(lambda: prepare_q_mla_absorbed_cuda(x, W_q, W_uk, q_positions, cfg))
     t_q_torch = time_ms(lambda: prepare_q_mla_absorbed(x, W_q, W_uk, q_positions, cfg))
 
-    q_raw = torch.matmul(x, W_q).view(B, Sq, H, cfg.qk_head_dim)
-    q_nope = q_raw[..., :nope]
-    q_rope_raw = q_raw[..., nope:]
-    t_q_gemm = time_ms(lambda: torch.matmul(x, W_q))
-    t_q_absorb = time_ms(lambda: torch.einsum("bshd,hdr->bshr", q_nope, W_uk_c))
-    t_q_rope = time_ms(lambda: apply_rope(q_rope_raw, q_positions, D))
-
-    print(f"  prepare_q_cuda (W_uk view)      {t_q_cuda:9.4f} ms")
-    print(f"  prepare_q_cuda (W_uk pre-contig){t_q_cuda_pre:9.4f} ms")
-    print(f"  prepare_q_torch                 {t_q_torch:9.4f} ms")
-    print(f"    .. x @ W_q  (big GEMM)        {t_q_gemm:9.4f} ms")
-    print(f"    .. absorb einsum             {t_q_absorb:9.4f} ms")
-    print(f"    .. apply_rope                {t_q_rope:9.4f} ms")
+    print(f"  prepare_q_cuda (fused)          {t_q_cuda:9.4f} ms")
+    print(f"  prepare_q_torch (baseline)      {t_q_torch:9.4f} ms")
 
     # ---- stage 3: attention ----
     t_attn_cuda = time_ms(
         lambda: mla_attention_official_cuda(qa, qr, c_kv, pe_cache, W_uv, cfg),
         iters=scenario.num_iters,
     )
-    t_attn_cuda_pre = time_ms(
-        lambda: mla_attention_official_cuda(qa, qr, c_kv, pe_cache, W_uv_c, cfg),
-        iters=scenario.num_iters,
-    )
     t_attn_torch = time_ms(
-        lambda: mla_attention_official(qa, qr, c_kv, pe_cache, W_uv_c, cfg),
+        lambda: mla_attention_official(qa, qr, c_kv, pe_cache, W_uv, cfg),
         iters=scenario.num_iters,
     )
-    print(f"  attention CUDA (W_uv view)      {t_attn_cuda:9.4f} ms")
-    print(f"  attention CUDA (pre-contig)     {t_attn_cuda_pre:9.4f} ms")
-    print(f"  attention PyTorch (cuBLAS)      {t_attn_torch:9.4f} ms")
+    print(f"  attention CUDA (fused)          {t_attn_cuda:9.4f} ms")
+    print(f"  attention PyTorch (baseline)    {t_attn_torch:9.4f} ms")
 
     # ---- roofline for a fused stage-3 kernel ----
     flop_scores = 2 * B * Sq * H * Sk * (R + D)
@@ -121,7 +102,7 @@ def profile(scenario, cfg):
     print(f"  scores round-trip HBM (GB)      {bytes_scores_materialized / 1e9:9.3f}"
           f"   -> {bytes_scores_materialized / 1e9 / PEAK_HBM_GBPS * 1e3:7.3f} ms  (fusion deletes this)")
 
-    del tensors, x, c_kv, pe_cache, W_q, wkv_b, qa, qr, q_raw
+    del tensors, x, c_kv, pe_cache, W_q, wkv_b, qa, qr
     torch.cuda.empty_cache()
 
 

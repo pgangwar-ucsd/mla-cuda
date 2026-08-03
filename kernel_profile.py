@@ -17,10 +17,10 @@ from exhaustive_benchmark_suite import (
 
 def run(scenario, cfg):
     tensors = make_mla_tensors(scenario, cfg)
-    x, c_kv, pe_cache, W_q, wkv_b, _ = tensors
+    x, c_kv, pe_cache, W_q, wkv_b, q_positions = tensors
     W_uk, W_uv = split_wkv_b(wkv_b, cfg)
     W_uv = W_uv.contiguous()
-    qa, qr = prepare_q_mla_absorbed_cuda(x, W_q, W_uk, cfg)
+    qa, qr = prepare_q_mla_absorbed_cuda(x, W_q, W_uk, q_positions, cfg)
 
     for _ in range(3):
         mla_attention_official_cuda(qa, qr, c_kv, pe_cache, W_uv, cfg)

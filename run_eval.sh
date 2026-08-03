@@ -2,11 +2,11 @@
 #
 # Usage examples (args are forwarded to exhaustive_benchmark_suite.py):
 #   bash run_eval.sh --quick
-#   bash run_eval.sh --cuda-attn-only --decode-focus
-#   bash run_eval.sh --cuda-attn-only --scenarios decode_single_64k_cache decode_production_avg_cache
-#   bash run_eval.sh --scenario decode_production_avg_cache --cuda-attn-only
+#   bash run_eval.sh --decode-focus
+#   bash run_eval.sh --scenarios decode_single_64k_cache decode_production_avg_cache
+#   bash run_eval.sh --scenario decode_production_avg_cache
 #
-# Skip rebuild: MLA_SKIP_BUILD=1 bash run_eval.sh --decode-focus --cuda-attn-only
+# Skip rebuild: MLA_SKIP_BUILD=1 bash run_eval.sh --decode-focus
 
 CONDA_ENV="${MLA_CONDA_ENV:-ece285}"
 CONDA_ROOT="${CONDA_ROOT:-$HOME/miniconda3}"
