@@ -21,7 +21,7 @@ setup(
     ext_modules=[
         CUDAExtension(
             name='mla_custom_cuda',
-            sources=['naive_fused_kernel_your_playground.cu'],
+            sources=['mla_kernels.cu'],
             extra_compile_args=extra_compile_args,
         )
     ],

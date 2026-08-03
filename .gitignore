@@ -1,0 +1,8 @@
+# Build artifacts from `pip install -e .`
+build/
+*.so
+*.egg-info/
+
+# Python
+__pycache__/
+*.py[cod]

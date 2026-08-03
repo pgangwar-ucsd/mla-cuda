@@ -1,6 +1,0 @@
-naive_fused_kernel_your_playground.cu
-setup.py
-mla_custom_cuda.egg-info/PKG-INFO
-mla_custom_cuda.egg-info/SOURCES.txt
-mla_custom_cuda.egg-info/dependency_links.txt
-mla_custom_cuda.egg-info/top_level.txt
