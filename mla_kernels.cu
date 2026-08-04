@@ -35,7 +35,6 @@ static constexpr int kScoreSkTile    = kScoreThreadsX * kRegTile;  // 128 keys o
 static constexpr int kCtxRankTile    = kScoreThreadsX * kRegTile;  // 128 kv_rank out (3c)
 static constexpr int kScoreRankTile  = 64;  // reduce over kv_rank (3a)
 static constexpr int kCtxSkTile      = 64;  // reduce over Sk      (3c)
-static constexpr int kRopeDim        = 64;  // qk_rope_head_dim (compile-time for unroll)
 
 // Kernel 2 (Q-prep): same 32×16 / 4×4 shape. Blocking over bq (not one block per
 // (b,s,h)) is what keeps W_q traffic bounded: a (b,s,h)-per-block layout re-reads
@@ -187,14 +186,17 @@ q_raw_gemm_kernel(
         const int tile_len =
             (k0 + kQHiddenTile <= hidden_dim) ? kQHiddenTile : (hidden_dim - k0);
 
-        // stage x[bq_base:+kBqTile, k0:+tile) — k contiguous → k_local = idx % tile_len
-        const int x_elems = kBqTile * tile_len;
+        // stage x[bq_base:+kBqTile, k0:+tile) — k contiguous so warps coalesce.
+        // Using full-tile extent, not tile_len, so the div/mod fold to shift and mask
+        // rather than a runtime integer division; a short trailing tile is handled by
+        // predicating the store.
+        const int x_elems = kBqTile * kQHiddenTile;
         for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
              idx < x_elems; idx += coop_stride) {
-            const int lb_s    = idx / tile_len;
-            const int k_local = idx % tile_len;
+            const int lb_s    = idx / kQHiddenTile;
+            const int k_local = idx % kQHiddenTile;
             const int bq_s    = bq_base + lb_s;
-            if (bq_s < bq_total)
+            if (bq_s < bq_total && k_local < tile_len)
                 x_smem[lb_s * kQHiddenTile + (k_local ^ (lb_s & (kQHiddenTile - 1)))] =
                     static_cast<acc_t>(x[bq_s * hidden_dim + k0 + k_local]);
         }
@@ -265,16 +267,8 @@ q_raw_gemm_kernel(
 }
 
 // --- 2b. RoPE on the rope half of q_raw → Q_rope [B, Sq, H, rope_dim] ---
-// One thread per (bq, h, adjacent pair). The angle is built in the accumulate dtype,
-// so an fp64 request gets genuinely fp64 trig. (The PyTorch reference
-// exhaustive_benchmark_suite.apply_rope always builds freqs/angles in fp32 and only
-// casts cos/sin down afterwards, so an fp64 comparison against *it* bottoms out at
-// ~1e-8 — that is the reference's precision, not this kernel's.)
-//
-// `positions[s]` is the *absolute* position of query s, supplied by the caller. It is
-// not derivable here: during decode sq == 1 but the single query sits at the end of the
-// KV cache (position Sk), not at 0. Deriving it as `bq % sq` would silently apply a
-// zero-angle — an identity rotation — to every decode query.
+// One thread per (bq, h, adjacent pair). 
+// `positions[s]` is the *absolute* position of query s, supplied by the caller. 
 template <typename scalar_t>
 __global__ void __launch_bounds__(kRopeThreads)
 q_rope_kernel(
@@ -319,9 +313,9 @@ q_rope_kernel(
 }
 
 // --- 2c. Q_absorbed = q_nope @ W_uk[h]: 4×4 tile/thread; grid (bq, r, head) ---
-//   One head per block-column so W_uk[h] is staged once and amortised over 64 bq,
-//   exactly like 3d does with W_uv. The nope half is read straight out of q_raw at
-//   stride qk_head_dim — no repacking pass.
+//   One head per block-column so W_uk[h] is staged once and amortised over 64 bq. 
+//   The nope half is read straight out of q_raw at
+//   stride qk_head_dim.
 //   grid.x: bq tiles (64 bq/block)   grid.y: r tiles (128 ranks/block)   grid.z: h
 //   block: 32×16 → each thread 4 ranks × 4 bq; nope reduced in SMEM tiles of 64
 template <typename scalar_t, int kBqReg>
@@ -381,14 +375,17 @@ q_absorb_kernel(
         const int tile_len =
             (n0 + kQNopeTile <= nope_dim) ? kQNopeTile : (nope_dim - n0);
 
-        // stage q_raw[bq, h, n0:+tile) — n contiguous → n_local = idx % tile_len
-        const int qn_elems = kBqTile * tile_len;
+        // stage q_raw[bq, h, n0:+tile) — n contiguous so warps coalesce.
+        // Using Full-tile extent, not tile_len, so the div/mod fold to shift and mask
+        // rather than a runtime integer division; a short trailing tile is handled by
+        // predicating the store. 
+        const int qn_elems = kBqTile * kQNopeTile;
         for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
              idx < qn_elems; idx += coop_stride) {
-            const int lb_s    = idx / tile_len;
-            const int n_local = idx % tile_len;
+            const int lb_s    = idx / kQNopeTile;
+            const int n_local = idx % kQNopeTile;
             const int bq_s    = bq_base + lb_s;
-            if (bq_s < bq_total)
+            if (bq_s < bq_total && n_local < tile_len)
                 qn_smem[lb_s * kQNopeTile + (n_local ^ (lb_s & (kQNopeTile - 1)))] =
                     q_raw[bq_s * (num_heads * qk_head_dim) + qn_head_base + n0 + n_local];
         }
@@ -586,11 +583,11 @@ std::vector<torch::Tensor> launch_q_absorbed(
 // KERNEL 3: Official absorbed MLA attention
 //
 //  3a. scores — grid.x over flat(B,Sq,128), grid.y over Sk
-//      16×32 threads/block → 64×128 scores/block; each thread → 4×4 tile (q × c_kv)
-//      kv_rank=512 contracted in SMEM tiles of kScoreRankTile=64 (block-level reduction)
-//      scores_nope: [B,Sq,H,512] @ [B,Sk,512]^T → [B,Sq,H,Sk]
-//      scores_rope: [B,Sq,H,64]  @ [B,Sk,64]^T  → [B,Sq,H,Sk]
-//      merge + /sqrt(192)
+//      32×16 threads/block → 64×128 scores/block; each thread → 4×4 tile (q × c_kv)
+//      one (kv_rank + rope_dim) = 576-deep reduction in SMEM tiles of 64:
+//        r <  512 draws from q_absorbed [B,Sq,H,512] and c_kv     [B,Sk,512]
+//        r >= 512 draws from q_rope     [B,Sq,H,64]  and pe_cache [B,Sk,64]
+//      then /sqrt(192)
 //  3b. softmax → attn [B,Sq,H,Sk]   (one block per (B*Sq, H) row)
 //  3c. ctx — same 16×32 / 4×4 tiling as 3a; grid.x=flat, grid.y=kv_rank
 //      64 flats × 128 ranks/block; Sk contracted in SMEM tiles of kCtxSkTile=64
@@ -607,8 +604,9 @@ std::vector<torch::Tensor> launch_q_absorbed(
 //   threadIdx.x owns k (contiguous in `scores`), threadIdx.y owns flat: a warp
 //   writes 32 adjacent keys of one score row, so the epilogue is one 128 B store
 //   SMEM [lf][r] / [lk][r] with col XOR swizzle (no padding): bank = (r^row)%32
-//   Staging: r (or rope d) is idx% — matches HBM contiguous dim for coalescing
+//   Staging: r is idx% — matches the HBM contiguous dim of all four sources
 //   Reduction is r-outer: 4 qa + 4 ck loads → 16 FMAs, so 0.5 SMEM loads per FMA
+//   rope_dim is read at runtime; nothing here is specialised to its value
 template <typename scalar_t>
 __global__ void __launch_bounds__(kTileBlockThreads, kTileMinBlocksPerSM)
 mla_scores_kernel(
@@ -632,7 +630,7 @@ mla_scores_kernel(
     const int k0         = blockIdx.y * kScoreSkTile;
 
     // qa_smem[kFlatTile][kScoreRankTile]; ck_smem[kScoreSkTile][kScoreRankTile]
-    // — both reused as qr_smem/pe_smem after phase 1
+    // — the rope tile reuses them as the trailing slice of the same reduction
     acc_t* smem    = dynamic_smem<acc_t>();
     acc_t* qa_smem = smem;
     acc_t* ck_smem = qa_smem + kFlatTile * kScoreRankTile;
@@ -678,34 +676,50 @@ mla_scores_kernel(
     for (int dk = 0; dk < kRegTile; ++dk)
         lk_m[dk] = lk[dk] & (kScoreRankTile - 1);
 
-    // ---- Phase 1: scores_nope — fuse qa+ck SMEM loads, one sync per kv_rank tile ----
-    for (int r0 = 0; r0 < kv_rank; r0 += kScoreRankTile) {
-        const int tile_len =
-            (r0 + kScoreRankTile <= kv_rank) ? kScoreRankTile : (kv_rank - r0);
+    // ---- One reduction over the full qk depth: kv_rank then rope_dim ----
+    // scores = q_absorbed·c_kv + q_rope·pe_cache is a single (kv_rank + rope_dim)-deep
+    // dot product that happens to draw its operands from two pairs of tensors. Running
+    // it as one loop rather than two phases means the rope contribution is just the
+    // trailing tile: no mid-kernel re-stage of aliased SMEM, no extra __syncthreads
+    // pair, one swizzle mask set, and one SMEM row width (kScoreRankTile) throughout.
+    for (int r0 = 0; r0 < kv_rank + rope_dim; r0 += kScoreRankTile) {
+        // Uniform across the block (r0 is a loop counter), so no warp divergence.
+        const bool rope     = r0 >= kv_rank;
+        const int  depth    = rope ? rope_dim : kv_rank;  // extent of the source operand
+        const int  r_base   = rope ? (r0 - kv_rank) : r0; // offset within that operand
+        const int  tile_len = min(kScoreRankTile, depth - r_base);
 
-        // cooperative: stage Q_absorbed → qa_smem[lf][r^lf]
-        // q_absorbed[flat, r] is contiguous in r → r_local must be idx% so warps coalesce
-        const int qa_elems = kFlatTile * tile_len;
+        // Cooperative staging. The loop extent is the *full* tile width, not tile_len,
+        // so the div/mod fold to a shift and a mask instead of an integer division by a
+        // runtime value; a short trailing tile is handled by predicating the store. 
+        const int stage_elems_q = kFlatTile    * kScoreRankTile;
+        const int stage_elems_k = kScoreSkTile * kScoreRankTile;
+
+        // stage the q side → qa_smem[lf][r^lf]
+        // both sources are contiguous in r → r_local must be idx% so warps coalesce
         for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
-             idx < qa_elems; idx += coop_stride) {
-            const int lf_s    = idx / tile_len;
-            const int r_local = idx % tile_len;
+             idx < stage_elems_q; idx += coop_stride) {
+            const int lf_s    = idx / kScoreRankTile;
+            const int r_local = idx % kScoreRankTile;
             const int flat_s  = flat_base + lf_s;
-            if (flat_s < flat_total)
+            if (flat_s < flat_total && r_local < tile_len)
                 qa_smem[lf_s * kScoreRankTile + (r_local ^ (lf_s & (kScoreRankTile - 1)))] =
-                    static_cast<acc_t>(q_absorbed[flat_s * kv_rank + r0 + r_local]);
+                    static_cast<acc_t>(
+                        rope ? q_rope[flat_s * rope_dim + r_base + r_local]
+                             : q_absorbed[flat_s * kv_rank + r_base + r_local]);
         }
 
-        // cooperative: stage c_kv → ck_smem[lk][r^lk]  (r contiguous in c_kv[k, r])
-        const int ck_elems = kScoreSkTile * tile_len;
+        // stage the k side → ck_smem[lk][r^lk] (contiguous in r either way)
         for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
-             idx < ck_elems; idx += coop_stride) {
-            const int lk_s    = idx / tile_len;
-            const int r_local = idx % tile_len;
+             idx < stage_elems_k; idx += coop_stride) {
+            const int lk_s    = idx / kScoreRankTile;
+            const int r_local = idx % kScoreRankTile;
             const int k_s     = k0 + lk_s;
-            if (k_s < sk)
+            if (k_s < sk && r_local < tile_len)
                 ck_smem[lk_s * kScoreRankTile + (r_local ^ (lk_s & (kScoreRankTile - 1)))] =
-                    static_cast<acc_t>(c_kv[ck_batch_stride + k_s * kv_rank + r0 + r_local]);
+                    static_cast<acc_t>(
+                        rope ? pe_cache[pe_batch_stride + k_s * rope_dim + r_base + r_local]
+                             : c_kv[ck_batch_stride + k_s * kv_rank + r_base + r_local]);
         }
         __syncthreads();  // loads done before any thread reads this tile
 
@@ -747,68 +761,7 @@ mla_scores_kernel(
                         s[di][dk] += qa_reg[di] * ck_reg[dk];
             }
         }
-        __syncthreads();  // all reads done before next tile (or rope) overwrites SMEM
-    }
-
-    // ---- Phase 2: scores_rope — accumulate into same s[][] (no second tile regs) ----
-    // The SMEM side is addressed with the compile-time kRopeDim throughout, matching the
-    // reduction loop below; `rope_dim` is used only for the HBM strides. The launcher
-    // enforces rope_dim == kRopeDim, so the two agree — but they must be *written* the
-    // same way, or a mismatch would stage with one row stride and read back with another.
-    acc_t* qr_smem = qa_smem;  // [64][kRopeDim] with XOR swizzle
-    acc_t* pe_smem = ck_smem;  // [128][kRopeDim] with XOR swizzle
-
-    const int qr_elems = kFlatTile * kRopeDim;
-    for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
-         idx < qr_elems; idx += coop_stride) {
-        // q_rope[flat, d] contiguous in d
-        const int lf_s = idx / kRopeDim;
-        const int d    = idx % kRopeDim;
-        const int flat_s = flat_base + lf_s;
-        if (flat_s < flat_total)
-            qr_smem[lf_s * kRopeDim + (d ^ (lf_s & (kRopeDim - 1)))] =
-                static_cast<acc_t>(q_rope[flat_s * rope_dim + d]);
-    }
-
-    const int pe_elems = kScoreSkTile * kRopeDim;
-    for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
-         idx < pe_elems; idx += coop_stride) {
-        // pe_cache[k, d] contiguous in d
-        const int lk_s = idx / kRopeDim;
-        const int d    = idx % kRopeDim;
-        const int k_s  = k0 + lk_s;
-        if (k_s < sk)
-            pe_smem[lk_s * kRopeDim + (d ^ (lk_s & (kRopeDim - 1)))] =
-                static_cast<acc_t>(pe_cache[pe_batch_stride + k_s * rope_dim + d]);
-    }
-    __syncthreads();
-
-    // qr_smem / pe_smem have row width kRopeDim, not kScoreRankTile, so the nope-phase
-    // masks do not carry over — they are only interchangeable while the two constants
-    // happen to be equal.
-    int lf_rm[kRegTile], lk_rm[kRegTile];
-    #pragma unroll
-    for (int di = 0; di < kRegTile; ++di)
-        lf_rm[di] = lf[di] & (kRopeDim - 1);
-    #pragma unroll
-    for (int dk = 0; dk < kRegTile; ++dk)
-        lk_rm[dk] = lk[dk] & (kRopeDim - 1);
-
-    // d-outer register strip; rope_dim is a full compile-time tile, so no ragged path
-    #pragma unroll 8
-    for (int d = 0; d < kRopeDim; ++d) {
-        acc_t qr_reg[kRegTile], pe_reg[kRegTile];
-        #pragma unroll
-        for (int di = 0; di < kRegTile; ++di)
-            qr_reg[di] = qr_smem[lf[di] * kRopeDim + (d ^ lf_rm[di])];
-        #pragma unroll
-        for (int dk = 0; dk < kRegTile; ++dk)
-            pe_reg[dk] = pe_smem[lk[dk] * kRopeDim + (d ^ lk_rm[dk])];
-        #pragma unroll
-        for (int di = 0; di < kRegTile; ++di)
-            #pragma unroll
-            for (int dk = 0; dk < kRegTile; ++dk)
-                s[di][dk] += qr_reg[di] * pe_reg[dk];
+        __syncthreads();  // all reads done before the next tile overwrites SMEM
     }
 
     // Bounds are recomputed here rather than carried in registers through the loops.
@@ -1007,14 +960,17 @@ mla_ctx_kernel(
         const int tile_len =
             (k0 + kCtxSkTile <= k_end) ? kCtxSkTile : (k_end - k0);
 
-        // stage attn[flat, k0:k0+tile) — k contiguous → k_local = idx % tile_len
-        const int attn_elems = kFlatTile * tile_len;
+        // stage attn[flat, k0:k0+tile) — k contiguous so warps coalesce.
+        // Using Full-tile extent, not tile_len, so the div/mod fold to shift and mask
+        // rather than a runtime integer division; a short trailing tile is handled by
+        // predicating the store.
+        const int attn_elems = kFlatTile * kCtxSkTile;
         for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
              idx < attn_elems; idx += coop_stride) {
-            const int lf_s    = idx / tile_len;
-            const int k_local = idx % tile_len;
+            const int lf_s    = idx / kCtxSkTile;
+            const int k_local = idx % kCtxSkTile;
             const int flat_s  = flat_base + lf_s;
-            if (flat_s < flat_total)
+            if (flat_s < flat_total && k_local < tile_len)
                 attn_smem[lf_s * kCtxSkTile + (k_local ^ (lf_s & (kCtxSkTile - 1)))] =
                     attn[flat_s * sk + k0 + k_local];
         }
@@ -1157,27 +1113,30 @@ mla_output_smem_kernel(
         const int tile_len =
             (r0 + kOutRankTile <= kv_rank) ? kOutRankTile : (kv_rank - r0);
 
-        // stage ctx[bq_base:+64, h, r0:+tile) — r contiguous → r_local = idx % tile_len
-        const int ctx_elems = kBqTile * tile_len;
+        // stage ctx[bq_base:+kBqTile, h, r0:+tile) — r contiguous so warps coalesce.
+        // Full-tile extent, not tile_len, so the div/mod fold to a shift and a mask
+        // rather than a runtime integer division; a short trailing tile is handled by
+        // predicating the store. Measured 26% off mla_scores_kernel.
+        const int ctx_elems = kBqTile * kOutRankTile;
         for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
              idx < ctx_elems; idx += coop_stride) {
-            const int lb_s    = idx / tile_len;
-            const int r_local = idx % tile_len;
+            const int lb_s    = idx / kOutRankTile;
+            const int r_local = idx % kOutRankTile;
             const int bq_s    = bq_base + lb_s;
-            if (bq_s < bq_total)
+            if (bq_s < bq_total && r_local < tile_len)
                 ctx_smem[lb_s * kOutRankTile + (r_local ^ (lb_s & (kOutRankTile - 1)))] =
                     static_cast<acc_t>(
                         ctx[(bq_s * num_heads) * kv_rank + ctx_head_base + r0 + r_local]);
         }
 
         // stage W_uv[h, d_base:+128, r0:+tile) — reused by all 64 bq in this block
-        const int w_elems = kOutVTile * tile_len;
+        const int w_elems = kOutVTile * kOutRankTile;
         for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
              idx < w_elems; idx += coop_stride) {
-            const int ld_s    = idx / tile_len;
-            const int r_local = idx % tile_len;
+            const int ld_s    = idx / kOutRankTile;
+            const int r_local = idx % kOutRankTile;
             const int d_s     = d_base + ld_s;
-            if (d_s < v_dim)
+            if (d_s < v_dim && r_local < tile_len)
                 w_smem[ld_s * kOutRankTile + (r_local ^ (ld_s & (kOutRankTile - 1)))] =
                     static_cast<acc_t>(
                         W_uv[w_head_base + d_s * kv_rank + r0 + r_local]);
@@ -1252,14 +1211,6 @@ torch::Tensor launch_mla_attention(
     int v_dim      = W_uv.size(1);
 
     const int flat_total = batch_size * sq * num_heads;
-
-    // 3a unrolls its rope reduction over the compile-time kRopeDim and reuses the
-    // kScoreRankTile-wide nope tiles for the rope staging, so a different runtime rope_dim
-    // would both mis-stride the SMEM and overrun those tiles. Reject it rather than
-    // return quiet garbage.
-    TORCH_CHECK(rope_dim == kRopeDim,
-                "MLA: rope_dim must be ", kRopeDim, " (got ", rope_dim,
-                "); kRopeDim is compile-time in mla_scores_kernel");
 
     // Stage 3 stages, accumulates and stores intermediates in the accumulate dtype:
     // fp64 in stays fp64 end to end, fp16 promotes to fp32 (see AccType).
