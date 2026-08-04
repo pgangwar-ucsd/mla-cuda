@@ -78,13 +78,18 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 the `mla_custom_cuda` extension, and runs the benchmark suite:
 
 ```bash
-bash run_eval.sh --quick              # fast smoke test
-bash run_eval.sh                      # full default scenario set
-bash run_eval.sh --decode-focus       # long-cache decode scenarios only
+bash run_eval.sh --quick              # smoke test only (1 scenario)
+bash run_eval.sh                      # default set: 12 scenarios (everything except --include-large)
+bash run_eval.sh --phase decode       # ALL 7 decode scenarios
+bash run_eval.sh --phase prefill      # ALL 4 prefill scenarios
+bash run_eval.sh --include-large      # adds prefill_nvidia_reference (sq=sk=8192, may OOM)
+
+# Named subsets — note --decode-focus is NOT "all decode": it is a hardcoded
+# 2-scenario tuning subset (decode_single_64k_cache, decode_production_avg_cache).
+# Use --phase decode to run all 7.
+bash run_eval.sh --decode-focus
 bash run_eval.sh --scenario decode_production_avg_cache
 bash run_eval.sh --scenarios decode_single_64k_cache decode_production_avg_cache
-bash run_eval.sh --phase prefill
-bash run_eval.sh --include-large      # also run scenarios that may OOM (e.g. sq=sk=8192)
 ```
 
 Skip the rebuild step (if the extension is already built) with:
