@@ -73,6 +73,11 @@ static constexpr int kQHiddenTile = kTileRed;                  // reduce over hi
 static constexpr int kQHiddenPad  = kTileRedPad;
 static constexpr int kQNopeTile   = kTileRed;                  // reduce over nope_dim
 static constexpr int kQNopePad    = kTileRedPad;
+// 2a split-K target: how many waves of blocks the grid should cover before the tail wave
+// stops mattering. A W-wave grid loses at most 1/(W+1) of the machine to quantisation,
+// against the 43% that the un-split 1.14 waves loses. 8 also puts the common 192-block
+// case on exactly 8.0 waves; measured 2% faster on 2a than a target of 6.
+static constexpr int kQSplitTargetWaves = 8;
 static constexpr int kRopeThreads = 256;
 // 3b: many rows → small blocks maximise SMs busy; few rows → wide blocks so a
 // single-stream decode (B=Sq=1 gives only H=128 rows) still fills the machine.
@@ -151,9 +156,10 @@ static int sm_count() {
 //  2c.  absorb the nope half against W_uk[h]      → Q_absorbed [B,Sq,H,512]
 //
 
-// --- 2a. q_raw = x @ W_q: kBqReg×8 tile/thread; grid (W_q col tiles, bq tiles) ---
+// --- 2a. q_raw = x @ W_q: kBqReg×8 tile/thread; grid (W_q col tiles, bq tiles, split) ---
 //   grid.x: n ∈ [0, H*qk_head_dim)   — 128 columns per block (contiguous in q_raw)
 //   grid.y: bq = b*Sq + s            — kTileThreadsY*kBqReg rows per block
+//   grid.z: split-K slice over hidden — see below
 //   block: 16×16 → each thread 8 cols × kBqReg bq; hidden reduced in SMEM tiles of 32
 //   SMEM [lb][k] / [ln][k], rows padded to kQHiddenPad; k staged fast so the HBM
 //   reads coalesce
@@ -162,6 +168,18 @@ static int sm_count() {
 //   0.25 SMEM loads per FMA. Single-stream decode has bq_total == 1, where a 128-row
 //   tile would spend 127/128 of its FMAs on rows the epilogue discards — the bounds
 //   are only checked at the store — so it drops to a 16-row tile.
+//
+//   Split-K: grid.x is pinned at H*qk_head_dim/128 = 192 by the model shape, and
+//   grid.y collapses to 1 for every bq_total <= 128 — which is most of decode. 192
+//   blocks against 84 SMs x 2 resident is 1.14 waves: one full wave, then a tail wave
+//   holding 24 blocks with 144 slots idle. ncu confirms it (waves_per_multiprocessor
+//   1.14, sm__throughput 47% elapsed-normalised against l1tex 66% active-normalised —
+//   the gap is exactly the idle tail). grid.z chops the hidden reduction into
+//   `k_chunk`-sized slices; each accumulates a partial and atomically adds it into
+//   q_raw, which the host pre-zeroes. Slices are disjoint spans of hidden, so no
+//   traffic is duplicated — only the epilogue is paid `split` times. The host sets
+//   gridDim.z == 1 once the output dims alone fill the GPU, and `use_atomic` then
+//   selects plain stores so that path pays neither the memset nor the atomics.
 template <typename scalar_t, int kBqReg>
 __global__ void __launch_bounds__(kTileThreads, kTileBlocksPerSM)
 q_raw_gemm_kernel(
@@ -170,13 +188,19 @@ q_raw_gemm_kernel(
     acc_t_of<scalar_t>* __restrict__ q_raw,  // [B*Sq, H*qk_head_dim]
     int bq_total,
     int hidden_dim,
-    int n_total)
+    int n_total,
+    int k_chunk,    // hidden elements owned by one grid.z slice (multiple of kQHiddenTile)
+    bool use_atomic)
 {
     using acc_t = acc_t_of<scalar_t>;
     constexpr int kBqTile = kTileThreadsY * kBqReg;  // bq rows this block owns
 
     const int n_base  = blockIdx.x * kQWqColTile;
     const int bq_base = blockIdx.y * kBqTile;
+
+    // this block's slice of the hidden reduction; k_chunk == hidden when gridDim.z == 1
+    const int k_begin = blockIdx.z * k_chunk;
+    const int k_end   = min(k_begin + k_chunk, hidden_dim);
 
     acc_t* smem   = dynamic_smem<acc_t>();
     acc_t* x_smem = smem;                            // [kBqTile][kQHiddenPad]
@@ -201,9 +225,9 @@ q_raw_gemm_kernel(
     for (int dn = 0; dn < kTileReg; ++dn)
         ln[dn] = threadIdx.x + dn * blockDim.x;
 
-    for (int k0 = 0; k0 < hidden_dim; k0 += kQHiddenTile) {
+    for (int k0 = k_begin; k0 < k_end; k0 += kQHiddenTile) {
         const int tile_len =
-            (k0 + kQHiddenTile <= hidden_dim) ? kQHiddenTile : (hidden_dim - k0);
+            (k0 + kQHiddenTile <= k_end) ? kQHiddenTile : (k_end - k0);
 
         // stage x[bq_base:+kBqTile, k0:+tile) — k contiguous so warps coalesce.
         // Full-tile extent, not tile_len, so the div/mod fold to shift and mask
@@ -271,6 +295,10 @@ q_raw_gemm_kernel(
         __syncthreads();  // all reads done before the next tile overwrites SMEM
     }
 
+    // Each grid.z slice owns a disjoint span of hidden, so the partials are a plain sum.
+    // Lanes of a warp differ in `n`, so these hit consecutive addresses; the only
+    // contention is between the gridDim.z blocks sharing an output tile, and each of
+    // them contributes exactly one atomic per element after its whole reduction.
     #pragma unroll
     for (int db = 0; db < kBqReg; ++db) {
         const int bq_i = bq_base + lb[db];
@@ -280,7 +308,8 @@ q_raw_gemm_kernel(
         for (int dn = 0; dn < kTileReg; ++dn) {
             const int n_i = n_base + ln[dn];
             if (n_i >= n_total) continue;
-            q_raw[row_base + n_i] = s[db][dn];
+            if (use_atomic) atomicAdd(&q_raw[row_base + n_i], s[db][dn]);
+            else            q_raw[row_base + n_i] = s[db][dn];
         }
     }
 }
@@ -502,20 +531,51 @@ std::vector<torch::Tensor> launch_q_absorbed(
     const auto acc_dtype = is_f64 ? torch::kFloat64 : torch::kFloat32;
     const size_t acc_size = is_f64 ? sizeof(double) : sizeof(float);
 
-    auto q_raw      = torch::empty({bq_total, n_total}, xc.options().dtype(acc_dtype));
+    // --- 2a split-K decision (needed up front: it picks how q_raw is initialised) ---
+    // grid.x is pinned at n_total/128 = 192 by the model shape, and grid.y collapses to 1
+    // for every bq_total <= 128 — most of decode. That launches 192 blocks against
+    // 84*2 = 168 resident slots: 1.14 waves, i.e. one full wave then a tail wave holding
+    // 24 blocks while 144 slots sit idle. Split the hidden reduction until the grid spans
+    // enough waves that the tail is a small fraction of them. Shapes whose output dims
+    // already fill the GPU (large batch, prefill) land on split == 1 and pay neither the
+    // pre-zero nor the atomics.
+    const int q_bq_tile  = bq_reg_for(bq_total) * kTileThreadsY;
+    const int q_n_tiles  = (n_total    + kQWqColTile  - 1) / kQWqColTile;
+    const int q_bq_tiles = (bq_total   + q_bq_tile    - 1) / q_bq_tile;
+    const int q_k_tiles  = (hidden_dim + kQHiddenTile - 1) / kQHiddenTile;
+
+    int q_split = (kQSplitTargetWaves * sm_count() * kTileBlocksPerSM)
+                / (q_n_tiles * q_bq_tiles);
+    if (q_split < 1)         q_split = 1;
+    if (q_split > q_k_tiles) q_split = q_k_tiles;
+
+    // Give each slice a whole number of SMEM tiles, then recompute the split from that so
+    // no slice ends up empty (a block on nothing) and only the last one can be ragged —
+    // keeping every other slice on the unrolled full-tile path.
+    const int q_chunk_tiles = (q_k_tiles + q_split - 1) / q_split;
+    q_split = (q_k_tiles + q_chunk_tiles - 1) / q_chunk_tiles;
+    const int  q_k_chunk = q_chunk_tiles * kQHiddenTile;
+    const bool q_atomic  = q_split > 1;
+
+    // atomicAdd accumulates, so the split-K partials need a zeroed destination
+    auto q_raw      = q_atomic
+        ? torch::zeros({bq_total, n_total}, xc.options().dtype(acc_dtype))
+        : torch::empty({bq_total, n_total}, xc.options().dtype(acc_dtype));
     auto q_absorbed = torch::empty({batch_size, sq, num_heads, kv_rank}, xc.options());
     auto q_rope_out = torch::empty({batch_size, sq, num_heads, rope_dim}, xc.options());
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    // 2a: grid.x=W_q col tiles, grid.y=bq tiles; 16×16 threads → bq tile × 128 cols
+    // 2a: grid.x=W_q col tiles, grid.y=bq tiles, grid.z=split-K slice over hidden;
+    //     16×16 threads → bq tile × 128 cols
     {
         dim3 threads(kTileThreadsX, kTileThreadsY);  // 16×16 = 256 threads
         AT_DISPATCH_FLOATING_TYPES_AND_HALF(xc.scalar_type(), "q_raw_gemm", ([&] {
             using acc_t = acc_t_of<scalar_t>;
             auto launch = [&](auto kernel, int bq_tile) {
                 dim3 blocks((n_total  + kQWqColTile - 1) / kQWqColTile,
-                            (bq_total + bq_tile     - 1) / bq_tile);
+                            (bq_total + bq_tile     - 1) / bq_tile,
+                            q_split);
                 // SMEM: x[bq_tile][32] + w[128][32] acc_t, rows padded to 33
                 size_t smem = static_cast<size_t>(
                     bq_tile + kQWqColTile) * kQHiddenPad * acc_size;
@@ -523,7 +583,7 @@ std::vector<torch::Tensor> launch_q_absorbed(
                 kernel<<<blocks, threads, smem, stream>>>(
                     xc.data_ptr<scalar_t>(), W_qc.data_ptr<scalar_t>(),
                     q_raw.data_ptr<acc_t>(),
-                    bq_total, hidden_dim, n_total);
+                    bq_total, hidden_dim, n_total, q_k_chunk, q_atomic);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
             };
             // Pick the narrowest bq tile that does not add a pass over the streamed
