@@ -86,7 +86,11 @@ def profile(scenario, cfg):
     flop_ctx = 2 * B * Sq * H * Sk * R
     flop_out = 2 * B * Sq * H * R * V
     flop_attn = flop_scores + flop_ctx + flop_out
-    flop_q = 2 * B * Sq * cfg.hidden_dim * H * cfg.qk_head_dim + 2 * B * Sq * H * nope * R
+    # Q projection is factorised through q_lora_rank: 7168 -> 1536 -> H*qk_head_dim,
+    # not one dense [hidden, H*qk_head_dim] matmul.
+    flop_q = (2 * B * Sq * cfg.hidden_dim * cfg.q_lora_rank
+              + 2 * B * Sq * cfg.q_lora_rank * H * cfg.qk_head_dim
+              + 2 * B * Sq * H * nope * R)
 
     # fused stage 3 only has to touch inputs + output once (scores never leave SMEM)
     bytes_fused = 4 * (B * Sq * H * (R + D) + B * Sk * (R + D) + B * Sq * H * V)

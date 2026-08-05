@@ -67,9 +67,9 @@ static constexpr int kCtxSkPad       = kTileRedPad;
 // Blocking over bq (not one block per (b,s,h)) is what keeps W_q traffic bounded: a
 // (b,s,h)-per-block layout re-reads head h's 5.5 MB W_q panel once per (b,s), i.e.
 // 90 GB at B=128. kBqReg is chosen per launch — see bq_reg_for().
-static constexpr int kQWqColTile  = kTileThreadsX * kTileReg;  // 128 W_q columns out
+static constexpr int kQWqColTile  = kTileThreadsX * kTileReg;  // 128 Q-projection cols out
 static constexpr int kQRankTile   = kTileThreadsX * kTileReg;  // 128 kv_rank out
-static constexpr int kQHiddenTile = kTileRed;                  // reduce over hidden
+static constexpr int kQHiddenTile = kTileRed;                  // reduce over hidden / q_lora
 static constexpr int kQHiddenPad  = kTileRedPad;
 static constexpr int kQNopeTile   = kTileRed;                  // reduce over nope_dim
 static constexpr int kQNopePad    = kTileRedPad;
@@ -79,6 +79,9 @@ static constexpr int kQNopePad    = kTileRedPad;
 // case on exactly 8.0 waves; measured 2% faster on 2a than a target of 6.
 static constexpr int kQSplitTargetWaves = 8;
 static constexpr int kRopeThreads = 256;
+// 2a-norm: one block per bq row over the q_lora latent (1536), so a single block
+// reduction covers the row and 256 threads is 6 elements each.
+static constexpr int kNormThreads = 256;
 // 3b: many rows → small blocks maximise SMs busy; few rows → wide blocks so a
 // single-stream decode (B=Sq=1 gives only H=128 rows) still fills the machine.
 static constexpr int kSoftmaxThreadsSmall = 256;
@@ -91,7 +94,7 @@ static constexpr int kOutRankPad  = kTileRedPad;
 
 // Widest bq register depth whose tile does not overshoot bq_total by more than one
 // step. A wider tile raises arithmetic intensity *and* cuts passes over the streamed
-// weight (W_q is 704 MB, re-read once per bq tile), but at bq_total=1 a 128-row tile
+// weight (W_q_b is 151 MB, re-read once per bq tile), but at bq_total=1 a 128-row tile
 // would discard 127/128 of its FMAs — the bounds are only checked at the store.
 static inline int bq_reg_for(int bq_total) {
     if (bq_total <= 1 * kTileThreadsY) return 1;
@@ -147,20 +150,58 @@ static int sm_count() {
     return cached[dev];
 }
 
+// Split-K plan for one q_raw_gemm launch. Both Q projections use the same kernel, but
+// they have very different grids — [bq, 7168] @ [7168, 1536] is only 12 column tiles
+// while [bq, 1536] @ [1536, 24576] is 192 — so each needs its own plan.
+struct QGemmSplit {
+    int  split;    // grid.z slices over the reduction
+    int  k_chunk;  // reduction elements per slice (a whole number of SMEM tiles)
+    bool atomic;   // > 1 slice, so the epilogue accumulates into a pre-zeroed output
+};
+
+static QGemmSplit plan_q_gemm_split(int bq_total, int cols, int k_total) {
+    const int bq_tile  = bq_reg_for(bq_total) * kTileThreadsY;
+    const int n_tiles  = (cols     + kQWqColTile  - 1) / kQWqColTile;
+    const int bq_tiles = (bq_total + bq_tile      - 1) / bq_tile;
+    const int k_tiles  = (k_total  + kQHiddenTile - 1) / kQHiddenTile;
+
+    int split = (kQSplitTargetWaves * sm_count() * kTileBlocksPerSM)
+              / (n_tiles * bq_tiles);
+    if (split < 1)       split = 1;
+    if (split > k_tiles) split = k_tiles;
+
+    // Give each slice a whole number of SMEM tiles, then recompute the split from that so
+    // no slice ends up empty (a block on nothing) and only the last one can be ragged —
+    // keeping every other slice on the unrolled full-tile path.
+    const int chunk_tiles = (k_tiles + split - 1) / split;
+    split = (k_tiles + chunk_tiles - 1) / chunk_tiles;
+    return QGemmSplit{split, chunk_tiles * kQHiddenTile, split > 1};
+}
+
 
 // ============================================================================
-// KERNEL 2: Q absorbed path — 2a (x @ W_q) → 2b (RoPE) → 2c (absorb @ W_uk)
+// KERNEL 2: Q absorbed path — 2a1 → 2a-norm → 2a2 → 2b (RoPE) → 2c (absorb @ W_uk)
 //
-//  2a. q_raw = x @ W_q            [B*Sq, hidden] @ [hidden, H*192] → [B*Sq, H*192]
+//  2a1. q_lat = x     @ W_q_a     [B*Sq, hidden] @ [hidden, 1536]  → [B*Sq, 1536]
+//  2a-n. RMSNorm over the q_lora latent           → q_lat      [B*Sq, 1536]
+//  2a2. q_raw = q_lat @ W_q_b     [B*Sq, 1536]   @ [1536, H*192]  → [B*Sq, H*192]
 //  2b.  RoPE on the rope half of q_raw            → Q_rope     [B,Sq,H,64]
 //  2c.  absorb the nope half against W_uk[h]      → Q_absorbed [B,Sq,H,512]
 //
+// DeepSeek-V3 factorises the Q projection as wq_b(q_norm(wq_a(x))) through a
+// q_lora_rank=1536 latent rather than applying one dense [7168, 24576] matrix. That is
+// 48.7M weights instead of 176M — 195 MB against 704 MB in fp32 — which dominates
+// single-stream decode, where 2a is a GEMV and reads every weight exactly once.
+//
 
-// --- 2a. q_raw = x @ W_q: kBqReg×8 tile/thread; grid (W_q col tiles, bq tiles, split) ---
-//   grid.x: n ∈ [0, H*qk_head_dim)   — 128 columns per block (contiguous in q_raw)
+// --- 2a. out = in @ W: kBqReg×8 tile/thread; grid (col tiles, bq tiles, split) ---
+//   Serves both halves of the factorised Q projection — 2a1 is [bq, 7168] @ [7168, 1536]
+//   and 2a2 is [bq, 1536] @ [1536, 24576]. Only the shapes and the split-K plan differ,
+//   so `hidden_dim` below is whichever reduction extent the call is contracting.
+//   grid.x: n ∈ [0, n_total)         — 128 columns per block (contiguous in the output)
 //   grid.y: bq = b*Sq + s            — kTileThreadsY*kBqReg rows per block
-//   grid.z: split-K slice over hidden — see below
-//   block: 16×16 → each thread 8 cols × kBqReg bq; hidden reduced in SMEM tiles of 32
+//   grid.z: split-K slice over the reduction — see below
+//   block: 16×16 → each thread 8 cols × kBqReg bq; reduction in SMEM tiles of 32
 //   SMEM [lb][k] / [ln][k], rows padded to kQHiddenPad; k staged fast so the HBM
 //   reads coalesce
 //
@@ -169,27 +210,27 @@ static int sm_count() {
 //   tile would spend 127/128 of its FMAs on rows the epilogue discards — the bounds
 //   are only checked at the store — so it drops to a 16-row tile.
 //
-//   Split-K: grid.x is pinned at H*qk_head_dim/128 = 192 by the model shape, and
-//   grid.y collapses to 1 for every bq_total <= 128 — which is most of decode. 192
-//   blocks against 84 SMs x 2 resident is 1.14 waves: one full wave, then a tail wave
-//   holding 24 blocks with 144 slots idle. ncu confirms it (waves_per_multiprocessor
-//   1.14, sm__throughput 47% elapsed-normalised against l1tex 66% active-normalised —
-//   the gap is exactly the idle tail). grid.z chops the hidden reduction into
-//   `k_chunk`-sized slices; each accumulates a partial and atomically adds it into
-//   q_raw, which the host pre-zeroes. Slices are disjoint spans of hidden, so no
-//   traffic is duplicated — only the epilogue is paid `split` times. The host sets
-//   gridDim.z == 1 once the output dims alone fill the GPU, and `use_atomic` then
-//   selects plain stores so that path pays neither the memset nor the atomics.
+//   Split-K: the column count is fixed by the model shape (2a2 is pinned at
+//   H*qk_head_dim/128 = 192 tiles, 2a1 at just 12), and grid.y collapses to 1 for every
+//   bq_total <= 128 — which is most of decode. 192 blocks against 84 SMs x 2 resident is
+//   1.14 waves: one full wave, then a tail wave holding 24 blocks with 144 slots idle.
+//   ncu confirms it (waves_per_multiprocessor 1.14, sm__throughput 47% elapsed-normalised
+//   against l1tex 66% active-normalised — the gap is exactly the idle tail). grid.z chops
+//   the reduction into `k_chunk`-sized slices; each accumulates a partial and atomically
+//   adds it into the output, which the host pre-zeroes. Slices are disjoint spans of the
+//   reduction, so no traffic is duplicated — only the epilogue is paid `split` times. The
+//   host sets gridDim.z == 1 once the output dims alone fill the GPU, and `use_atomic`
+//   then selects plain stores so that path pays neither the memset nor the atomics.
 template <typename scalar_t, int kBqReg>
 __global__ void __launch_bounds__(kTileThreads, kTileBlocksPerSM)
 q_raw_gemm_kernel(
-    const scalar_t* __restrict__ x,      // [B*Sq, hidden]
-    const scalar_t* __restrict__ W_q,    // [hidden, H*qk_head_dim]
-    acc_t_of<scalar_t>* __restrict__ q_raw,  // [B*Sq, H*qk_head_dim]
+    const scalar_t* __restrict__ x,      // [B*Sq, hidden_dim]
+    const scalar_t* __restrict__ W_q,    // [hidden_dim, n_total]
+    acc_t_of<scalar_t>* __restrict__ q_raw,  // [B*Sq, n_total]
     int bq_total,
-    int hidden_dim,
+    int hidden_dim,  // reduction extent: 7168 for 2a1, q_lora for 2a2
     int n_total,
-    int k_chunk,    // hidden elements owned by one grid.z slice (multiple of kQHiddenTile)
+    int k_chunk,    // reduction elements per grid.z slice (multiple of kQHiddenTile)
     bool use_atomic)
 {
     using acc_t = acc_t_of<scalar_t>;
@@ -217,13 +258,13 @@ q_raw_gemm_kernel(
 
     // threadIdx.y → bq (the row), threadIdx.x → n (contiguous in q_raw), so a warp
     // stores two runs of 8 adjacent q_raw columns rather than scattering across rows.
-    int lb[kBqReg], ln[kTileReg];
-    #pragma unroll
-    for (int db = 0; db < kBqReg; ++db)
-        lb[db] = threadIdx.y * kBqReg + db;
-    #pragma unroll
-    for (int dn = 0; dn < kTileReg; ++dn)
-        ln[dn] = threadIdx.x + dn * blockDim.x;
+    // Index bases; each element index is recomputed where it is used.
+    // lb(i) = lb0 + i and ln(j) = ln0 + j*kTileThreadsX are affine, so every SMEM
+    // access folds to a base register plus a compile-time immediate — the arrays cost no
+    // registers either way, but materialising them makes the epilogue emit redundant
+    // 64-bit address arithmetic (-264 SASS instructions in 3a when written this way).
+    const int lb0 = threadIdx.y * kBqReg;
+    const int ln0 = threadIdx.x;
 
     for (int k0 = k_begin; k0 < k_end; k0 += kQHiddenTile) {
         const int tile_len =
@@ -265,10 +306,10 @@ q_raw_gemm_kernel(
                 acc_t x_reg[kBqReg], w_reg[kTileReg];
                 #pragma unroll
                 for (int db = 0; db < kBqReg; ++db)
-                    x_reg[db] = x_smem[lb[db] * kQHiddenPad + k_local];
+                    x_reg[db] = x_smem[(lb0 + db) * kQHiddenPad + k_local];
                 #pragma unroll
                 for (int dn = 0; dn < kTileReg; ++dn)
-                    w_reg[dn] = w_smem[ln[dn] * kQHiddenPad + k_local];
+                    w_reg[dn] = w_smem[(ln0 + dn * kTileThreadsX) * kQHiddenPad + k_local];
                 #pragma unroll
                 for (int db = 0; db < kBqReg; ++db)
                     #pragma unroll
@@ -281,10 +322,10 @@ q_raw_gemm_kernel(
                 acc_t x_reg[kBqReg], w_reg[kTileReg];
                 #pragma unroll
                 for (int db = 0; db < kBqReg; ++db)
-                    x_reg[db] = x_smem[lb[db] * kQHiddenPad + k_local];
+                    x_reg[db] = x_smem[(lb0 + db) * kQHiddenPad + k_local];
                 #pragma unroll
                 for (int dn = 0; dn < kTileReg; ++dn)
-                    w_reg[dn] = w_smem[ln[dn] * kQHiddenPad + k_local];
+                    w_reg[dn] = w_smem[(ln0 + dn * kTileThreadsX) * kQHiddenPad + k_local];
                 #pragma unroll
                 for (int db = 0; db < kBqReg; ++db)
                     #pragma unroll
@@ -301,12 +342,12 @@ q_raw_gemm_kernel(
     // them contributes exactly one atomic per element after its whole reduction.
     #pragma unroll
     for (int db = 0; db < kBqReg; ++db) {
-        const int bq_i = bq_base + lb[db];
+        const int bq_i = bq_base + (lb0 + db);
         if (bq_i >= bq_total) continue;
         const int row_base = bq_i * n_total;
         #pragma unroll
         for (int dn = 0; dn < kTileReg; ++dn) {
-            const int n_i = n_base + ln[dn];
+            const int n_i = n_base + (ln0 + dn * kTileThreadsX);
             if (n_i >= n_total) continue;
             if (use_atomic) atomicAdd(&q_raw[row_base + n_i], s[db][dn]);
             else            q_raw[row_base + n_i] = s[db][dn];
@@ -314,9 +355,63 @@ q_raw_gemm_kernel(
     }
 }
 
+// --- 2a-norm. RMSNorm over the q_lora latent, between the two Q projections ---
+// out[i] = in[i] * rsqrt(mean(in^2) + eps) * gain[i], one block per bq row.
+//
+// The norm is what makes the factorisation more than a low-rank matrix: with nothing
+// between them, W_q_a @ W_q_b collapses into a single rank-1536 [7168, 24576] matrix.
+//
+// Reads 2a1's acc_t output and writes scalar_t, which is what lets 2a2 reuse
+// q_raw_gemm_kernel unchanged — that kernel takes a scalar_t left operand. Narrowing
+// here matches the existing policy for q_absorbed: accumulate wide, hand off narrow.
+template <typename scalar_t>
+__global__ void __launch_bounds__(kNormThreads)
+q_lat_norm_kernel(
+    const acc_t_of<scalar_t>* __restrict__ q_lat_acc,  // [B*Sq, q_lora]
+    const scalar_t* __restrict__ gain,                 // [q_lora]
+    scalar_t* __restrict__ q_lat,                      // [B*Sq, q_lora]
+    int q_lora,
+    acc_t_of<scalar_t> eps)
+{
+    using acc_t = acc_t_of<scalar_t>;
+    const size_t row = static_cast<size_t>(blockIdx.x) * q_lora;
+
+    acc_t ss = acc_t(0);
+    for (int i = threadIdx.x; i < q_lora; i += blockDim.x) {
+        const acc_t v = q_lat_acc[row + i];
+        ss += v * v;
+    }
+
+    // block reduction: warp shuffles, then one pass over the warp partials
+    #pragma unroll
+    for (int off = warpSize / 2; off > 0; off >>= 1)
+        ss += __shfl_down_sync(0xffffffffu, ss, off);
+
+    __shared__ acc_t warp_ss[32];  // <= 1024 threads → <= 32 warps
+    const int lane  = threadIdx.x & (warpSize - 1);
+    const int warp  = threadIdx.x / warpSize;
+    const int warps = (blockDim.x + warpSize - 1) / warpSize;
+    if (lane == 0) warp_ss[warp] = ss;
+    __syncthreads();
+
+    if (warp == 0) {
+        ss = (lane < warps) ? warp_ss[lane] : acc_t(0);
+        #pragma unroll
+        for (int off = warpSize / 2; off > 0; off >>= 1)
+            ss += __shfl_down_sync(0xffffffffu, ss, off);
+        if (lane == 0) warp_ss[0] = rsqrt(ss / acc_t(q_lora) + eps);
+    }
+    __syncthreads();
+
+    const acc_t inv_rms = warp_ss[0];
+    for (int i = threadIdx.x; i < q_lora; i += blockDim.x)
+        q_lat[row + i] = static_cast<scalar_t>(
+            q_lat_acc[row + i] * inv_rms * static_cast<acc_t>(gain[i]));
+}
+
 // --- 2b. RoPE on the rope half of q_raw → Q_rope [B, Sq, H, rope_dim] ---
-// One thread per (bq, h, adjacent pair). 
-// `positions[s]` is the *absolute* position of query s, supplied by the caller. 
+// One thread per (bq, h, adjacent pair).
+// `positions[s]` is the *absolute* position of query s, supplied by the caller.
 template <typename scalar_t>
 __global__ void __launch_bounds__(kRopeThreads)
 q_rope_kernel(
@@ -402,13 +497,13 @@ q_absorb_kernel(
             s[db][dr] = acc_t(0);
 
     // Only the SMEM row indices live across the reduction (see 2a / 3a).
-    int lb[kBqReg], lr[kTileReg];
-    #pragma unroll
-    for (int db = 0; db < kBqReg; ++db)
-        lb[db] = threadIdx.y * kBqReg + db;
-    #pragma unroll
-    for (int dr = 0; dr < kTileReg; ++dr)
-        lr[dr] = threadIdx.x + dr * blockDim.x;
+    // Index bases; each element index is recomputed where it is used.
+    // lb(i) = lb0 + i and lr(j) = lr0 + j*kTileThreadsX are affine, so every SMEM
+    // access folds to a base register plus a compile-time immediate — the arrays cost no
+    // registers either way, but materialising them makes the epilogue emit redundant
+    // 64-bit address arithmetic (-264 SASS instructions in 3a when written this way).
+    const int lb0 = threadIdx.y * kBqReg;
+    const int lr0 = threadIdx.x;
 
 
     for (int n0 = 0; n0 < nope_dim; n0 += kQNopeTile) {
@@ -450,10 +545,10 @@ q_absorb_kernel(
                 acc_t qn_reg[kBqReg], w_reg[kTileReg];
                 #pragma unroll
                 for (int db = 0; db < kBqReg; ++db)
-                    qn_reg[db] = qn_smem[lb[db] * kQNopePad + n_local];
+                    qn_reg[db] = qn_smem[(lb0 + db) * kQNopePad + n_local];
                 #pragma unroll
                 for (int dr = 0; dr < kTileReg; ++dr)
-                    w_reg[dr] = w_smem[lr[dr] * kQNopePad + n_local];
+                    w_reg[dr] = w_smem[(lr0 + dr * kTileThreadsX) * kQNopePad + n_local];
                 #pragma unroll
                 for (int db = 0; db < kBqReg; ++db)
                     #pragma unroll
@@ -466,10 +561,10 @@ q_absorb_kernel(
                 acc_t qn_reg[kBqReg], w_reg[kTileReg];
                 #pragma unroll
                 for (int db = 0; db < kBqReg; ++db)
-                    qn_reg[db] = qn_smem[lb[db] * kQNopePad + n_local];
+                    qn_reg[db] = qn_smem[(lb0 + db) * kQNopePad + n_local];
                 #pragma unroll
                 for (int dr = 0; dr < kTileReg; ++dr)
-                    w_reg[dr] = w_smem[lr[dr] * kQNopePad + n_local];
+                    w_reg[dr] = w_smem[(lr0 + dr * kTileThreadsX) * kQNopePad + n_local];
                 #pragma unroll
                 for (int db = 0; db < kBqReg; ++db)
                     #pragma unroll
@@ -482,12 +577,12 @@ q_absorb_kernel(
 
     #pragma unroll
     for (int db = 0; db < kBqReg; ++db) {
-        const int bq_i = bq_base + lb[db];
+        const int bq_i = bq_base + (lb0 + db);
         if (bq_i >= bq_total) continue;
         const int out_base = (bq_i * num_heads + head_idx) * kv_rank;
         #pragma unroll
         for (int dr = 0; dr < kTileReg; ++dr) {
-            const int r_i = r_base + lr[dr];
+            const int r_i = r_base + (lr0 + dr * kTileThreadsX);
             if (r_i >= kv_rank) continue;
             q_absorbed[out_base + r_i] = static_cast<scalar_t>(s[db][dr]);
         }
@@ -497,28 +592,37 @@ q_absorb_kernel(
 // Host launcher: CUDA Q-prep → {q_absorbed [B,Sq,H,kv_rank], q_rope [B,Sq,H,rope]}
 std::vector<torch::Tensor> launch_q_absorbed(
     torch::Tensor x,          // [B, Sq, hidden]
-    torch::Tensor W_q,        // [hidden, H*(nope+rope)]
+    torch::Tensor W_q_a,      // [hidden, q_lora]
+    torch::Tensor q_norm_w,   // [q_lora]           RMSNorm gain on the latent
+    torch::Tensor W_q_b,      // [q_lora, H*(nope+rope)]
     torch::Tensor W_uk,       // [H, nope, kv_rank]
     torch::Tensor positions,  // [Sq] int64 absolute position of each query
     int nope_dim,
-    int rope_dim)
+    int rope_dim,
+    double eps)
 {
     auto xc    = x.contiguous();
-    auto W_qc  = W_q.contiguous();
+    auto W_qac = W_q_a.contiguous();
+    auto gc    = q_norm_w.contiguous();
+    auto W_qbc = W_q_b.contiguous();
     auto W_ukc = W_uk.contiguous();
     auto posc  = positions.to(torch::kLong).contiguous();
 
     const int batch_size  = static_cast<int>(xc.size(0));
     const int sq          = static_cast<int>(xc.size(1));
     const int hidden_dim  = static_cast<int>(xc.size(2));
+    const int q_lora      = static_cast<int>(W_qac.size(1));
     const int num_heads   = static_cast<int>(W_ukc.size(0));
     const int kv_rank     = static_cast<int>(W_ukc.size(2));
     const int qk_head_dim = nope_dim + rope_dim;
     const int bq_total    = batch_size * sq;
     const int n_total     = num_heads * qk_head_dim;
 
-    TORCH_CHECK(W_qc.size(0) == hidden_dim && W_qc.size(1) == n_total,
-                "W_q must be [hidden, H*(nope+rope)]");
+    TORCH_CHECK(W_qac.size(0) == hidden_dim, "W_q_a must be [hidden, q_lora]");
+    TORCH_CHECK(W_qbc.size(0) == q_lora && W_qbc.size(1) == n_total,
+                "W_q_b must be [q_lora, H*(nope+rope)]");
+    TORCH_CHECK(gc.dim() == 1 && gc.size(0) == q_lora,
+                "q_norm_w must be a 1-D tensor of length q_lora (got ", gc.sizes(), ")");
     // Required, not defaulted: a wrong RoPE angle is silent, and the value cannot be
     // recovered here — during decode sq == 1 while the query sits at position Sk.
     TORCH_CHECK(posc.dim() == 1 && posc.size(0) == sq,
@@ -531,73 +635,80 @@ std::vector<torch::Tensor> launch_q_absorbed(
     const auto acc_dtype = is_f64 ? torch::kFloat64 : torch::kFloat32;
     const size_t acc_size = is_f64 ? sizeof(double) : sizeof(float);
 
-    // --- 2a split-K decision (needed up front: it picks how q_raw is initialised) ---
-    // grid.x is pinned at n_total/128 = 192 by the model shape, and grid.y collapses to 1
-    // for every bq_total <= 128 — most of decode. That launches 192 blocks against
-    // 84*2 = 168 resident slots: 1.14 waves, i.e. one full wave then a tail wave holding
-    // 24 blocks while 144 slots sit idle. Split the hidden reduction until the grid spans
-    // enough waves that the tail is a small fraction of them. Shapes whose output dims
-    // already fill the GPU (large batch, prefill) land on split == 1 and pay neither the
-    // pre-zero nor the atomics.
-    const int q_bq_tile  = bq_reg_for(bq_total) * kTileThreadsY;
-    const int q_n_tiles  = (n_total    + kQWqColTile  - 1) / kQWqColTile;
-    const int q_bq_tiles = (bq_total   + q_bq_tile    - 1) / q_bq_tile;
-    const int q_k_tiles  = (hidden_dim + kQHiddenTile - 1) / kQHiddenTile;
-
-    int q_split = (kQSplitTargetWaves * sm_count() * kTileBlocksPerSM)
-                / (q_n_tiles * q_bq_tiles);
-    if (q_split < 1)         q_split = 1;
-    if (q_split > q_k_tiles) q_split = q_k_tiles;
-
-    // Give each slice a whole number of SMEM tiles, then recompute the split from that so
-    // no slice ends up empty (a block on nothing) and only the last one can be ragged —
-    // keeping every other slice on the unrolled full-tile path.
-    const int q_chunk_tiles = (q_k_tiles + q_split - 1) / q_split;
-    q_split = (q_k_tiles + q_chunk_tiles - 1) / q_chunk_tiles;
-    const int  q_k_chunk = q_chunk_tiles * kQHiddenTile;
-    const bool q_atomic  = q_split > 1;
+    // --- split-K decisions (needed up front: they pick how each output is initialised) ---
+    // The column count of each projection is fixed by the model shape and grid.y collapses
+    // to 1 for every bq_total <= 128, so 2a2 launches 192 blocks against 84*2 = 168
+    // resident slots: 1.14 waves, i.e. one full wave then a tail wave holding 24 blocks
+    // while 144 slots sit idle. 2a1 is far worse at just 12 column tiles. Split the
+    // reduction until the grid spans enough waves that the tail is a small fraction of
+    // them; shapes whose output dims already fill the GPU (large batch, prefill) land on
+    // split == 1 and pay neither the pre-zero nor the atomics.
+    const QGemmSplit lat_split = plan_q_gemm_split(bq_total, q_lora,  hidden_dim);
+    const QGemmSplit raw_split = plan_q_gemm_split(bq_total, n_total, q_lora);
 
     // atomicAdd accumulates, so the split-K partials need a zeroed destination
-    auto q_raw      = q_atomic
-        ? torch::zeros({bq_total, n_total}, xc.options().dtype(acc_dtype))
-        : torch::empty({bq_total, n_total}, xc.options().dtype(acc_dtype));
+    auto gemm_out = [&](int cols, bool atomic) {
+        const auto opts = xc.options().dtype(acc_dtype);
+        return atomic ? torch::zeros({bq_total, cols}, opts)
+                      : torch::empty({bq_total, cols}, opts);
+    };
+    auto q_lat_acc  = gemm_out(q_lora,  lat_split.atomic);
+    auto q_raw      = gemm_out(n_total, raw_split.atomic);
+    auto q_lat      = torch::empty({bq_total, q_lora}, xc.options());
     auto q_absorbed = torch::empty({batch_size, sq, num_heads, kv_rank}, xc.options());
     auto q_rope_out = torch::empty({batch_size, sq, num_heads, rope_dim}, xc.options());
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    // 2a: grid.x=W_q col tiles, grid.y=bq tiles, grid.z=split-K slice over hidden;
-    //     16×16 threads → bq tile × 128 cols
+    // 2a1 → 2a-norm → 2a2. Both projections are [bq, K] @ [K, N] and share one kernel;
+    // only the shapes and the split-K plan differ.
+    // grid.x=col tiles, grid.y=bq tiles, grid.z=split-K slice; 16×16 → bq tile × 128 cols
     {
         dim3 threads(kTileThreadsX, kTileThreadsY);  // 16×16 = 256 threads
         AT_DISPATCH_FLOATING_TYPES_AND_HALF(xc.scalar_type(), "q_raw_gemm", ([&] {
             using acc_t = acc_t_of<scalar_t>;
-            auto launch = [&](auto kernel, int bq_tile) {
-                dim3 blocks((n_total  + kQWqColTile - 1) / kQWqColTile,
-                            (bq_total + bq_tile     - 1) / bq_tile,
-                            q_split);
-                // SMEM: x[bq_tile][32] + w[128][32] acc_t, rows padded to 33
-                size_t smem = static_cast<size_t>(
-                    bq_tile + kQWqColTile) * kQHiddenPad * acc_size;
-                enable_large_smem(kernel, smem);  // fp64 tiles exceed the default 48 KB
-                kernel<<<blocks, threads, smem, stream>>>(
-                    xc.data_ptr<scalar_t>(), W_qc.data_ptr<scalar_t>(),
-                    q_raw.data_ptr<acc_t>(),
-                    bq_total, hidden_dim, n_total, q_k_chunk, q_atomic);
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
+            auto run = [&](const scalar_t* in, const scalar_t* w, acc_t* out,
+                           int k_total, int cols, const QGemmSplit& sp) {
+                auto launch = [&](auto kernel, int bq_tile) {
+                    dim3 blocks((cols     + kQWqColTile - 1) / kQWqColTile,
+                                (bq_total + bq_tile     - 1) / bq_tile,
+                                sp.split);
+                    // SMEM: in[bq_tile][32] + w[128][32] acc_t, rows padded to 33
+                    size_t smem = static_cast<size_t>(
+                        bq_tile + kQWqColTile) * kQHiddenPad * acc_size;
+                    enable_large_smem(kernel, smem);  // fp64 tiles exceed the default 48 KB
+                    kernel<<<blocks, threads, smem, stream>>>(
+                        in, w, out, bq_total, k_total, cols, sp.k_chunk, sp.atomic);
+                    C10_CUDA_KERNEL_LAUNCH_CHECK();
+                };
+                // Pick the narrowest bq tile that does not add a pass over the streamed
+                // weight. Every bq tile re-streams the whole weight, so halving the tile
+                // only pays while it leaves ceil(bq_total / tile) unchanged — true up to
+                // 32 rows, not past it. At bq_total=33 a 32-row tile would compute the
+                // same 64 rows over two passes instead of one, trading no arithmetic for
+                // extra traffic. 2c and 3d below follow the same rule.
+                switch (bq_reg_for(bq_total)) {
+                  case 1:  launch(q_raw_gemm_kernel<scalar_t, 1>, 1 * kTileThreadsY); break;
+                  case 2:  launch(q_raw_gemm_kernel<scalar_t, 2>, 2 * kTileThreadsY); break;
+                  case 4:  launch(q_raw_gemm_kernel<scalar_t, 4>, 4 * kTileThreadsY); break;
+                  default: launch(q_raw_gemm_kernel<scalar_t, kTileReg>,
+                                  kTileReg * kTileThreadsY);
+                }
             };
-            // Pick the narrowest bq tile that does not add a pass over the streamed
-            // weight. Every bq tile re-streams the whole of W_q, so halving the tile only
-            // pays while it leaves ceil(bq_total / tile) unchanged — true up to 32 rows,
-            // not past it. At bq_total=33 a 32-row tile would compute the same 64 rows
-            // over two passes instead of one, trading no arithmetic for extra traffic.
-            // 2c and 3d below follow the same rule against W_uk / W_uv.
-            switch (bq_reg_for(bq_total)) {
-              case 1:  launch(q_raw_gemm_kernel<scalar_t, 1>, 1 * kTileThreadsY); break;
-              case 2:  launch(q_raw_gemm_kernel<scalar_t, 2>, 2 * kTileThreadsY); break;
-              case 4:  launch(q_raw_gemm_kernel<scalar_t, 4>, 4 * kTileThreadsY); break;
-              default: launch(q_raw_gemm_kernel<scalar_t, kTileReg>, kTileReg * kTileThreadsY);
-            }
+
+            // 2a1: x @ W_q_a → the q_lora latent
+            run(xc.data_ptr<scalar_t>(), W_qac.data_ptr<scalar_t>(),
+                q_lat_acc.data_ptr<acc_t>(), hidden_dim, q_lora, lat_split);
+
+            // 2a-norm: RMSNorm the latent, narrowing to the input dtype for 2a2
+            q_lat_norm_kernel<scalar_t><<<max(bq_total, 1), kNormThreads, 0, stream>>>(
+                q_lat_acc.data_ptr<acc_t>(), gc.data_ptr<scalar_t>(),
+                q_lat.data_ptr<scalar_t>(), q_lora, static_cast<acc_t>(eps));
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+            // 2a2: latent @ W_q_b → q_raw
+            run(q_lat.data_ptr<scalar_t>(), W_qbc.data_ptr<scalar_t>(),
+                q_raw.data_ptr<acc_t>(), q_lora, n_total, raw_split);
         }));
     }
 
@@ -724,17 +835,17 @@ mla_scores_kernel(
             s[di][dk] = acc_t(0);
 
     // SMEM row indices. Deliberately *not* accompanied by precomputed flat[]/k_idx[]/
-    // valid_*[] arrays: those are epilogue-only, and with __launch_bounds__(512, 2)
-    // pinning this kernel at exactly 64 registers (512 threads x 64 x 2 blocks fills
-    // the whole 64K register file), every value kept alive across the reduction is a
-    // register the scheduler cannot use to prefetch the next SMEM operand.
-    int lf[kTileReg], lk[kTileReg];
-    #pragma unroll
-    for (int di = 0; di < kTileReg; ++di)
-        lf[di] = threadIdx.y * kTileReg + di;
-    #pragma unroll
-    for (int dk = 0; dk < kTileReg; ++dk)
-        lk[dk] = threadIdx.x + dk * blockDim.x;
+    // valid_*[] arrays: those are epilogue-only, and this kernel sits at exactly the
+    // 128-register budget that 256 threads x 2 blocks/SM allows, so every value kept
+    // alive across the reduction is a register the scheduler cannot use to prefetch the
+    // next SMEM operand.
+    // Index bases; each element index is recomputed where it is used.
+    // lf(i) = lf0 + i and lk(j) = lk0 + j*kTileThreadsX are affine, so every SMEM
+    // access folds to a base register plus a compile-time immediate — the arrays cost no
+    // registers either way, but materialising them makes the epilogue emit redundant
+    // 64-bit address arithmetic (-264 SASS instructions in 3a when written this way).
+    const int lf0 = threadIdx.y * kTileReg;
+    const int lk0 = threadIdx.x;
 
 
     // ---- One reduction over the full qk depth: kv_rank then rope_dim ----
@@ -795,10 +906,10 @@ mla_scores_kernel(
                 acc_t qa_reg[kTileReg], ck_reg[kTileReg];
                 #pragma unroll
                 for (int di = 0; di < kTileReg; ++di)
-                    qa_reg[di] = qa_smem[lf[di] * kScoreRankPad + r_local];
+                    qa_reg[di] = qa_smem[(lf0 + di) * kScoreRankPad + r_local];
                 #pragma unroll
                 for (int dk = 0; dk < kTileReg; ++dk)
-                    ck_reg[dk] = ck_smem[lk[dk] * kScoreRankPad + r_local];
+                    ck_reg[dk] = ck_smem[(lk0 + dk * kTileThreadsX) * kScoreRankPad + r_local];
                 #pragma unroll
                 for (int di = 0; di < kTileReg; ++di)
                     #pragma unroll
@@ -811,10 +922,10 @@ mla_scores_kernel(
                 acc_t qa_reg[kTileReg], ck_reg[kTileReg];
                 #pragma unroll
                 for (int di = 0; di < kTileReg; ++di)
-                    qa_reg[di] = qa_smem[lf[di] * kScoreRankPad + r_local];
+                    qa_reg[di] = qa_smem[(lf0 + di) * kScoreRankPad + r_local];
                 #pragma unroll
                 for (int dk = 0; dk < kTileReg; ++dk)
-                    ck_reg[dk] = ck_smem[lk[dk] * kScoreRankPad + r_local];
+                    ck_reg[dk] = ck_smem[(lk0 + dk * kTileThreadsX) * kScoreRankPad + r_local];
                 #pragma unroll
                 for (int di = 0; di < kTileReg; ++di)
                     #pragma unroll
@@ -828,11 +939,11 @@ mla_scores_kernel(
     // Bounds are recomputed here rather than carried in registers through the loops.
     #pragma unroll
     for (int di = 0; di < kTileReg; ++di) {
-        const int flat_i = flat_base + lf[di];
+        const int flat_i = flat_base + (lf0 + di);
         if (flat_i >= flat_total) continue;
         #pragma unroll
         for (int dk = 0; dk < kTileReg; ++dk) {
-            const int k_i = k0 + lk[dk];
+            const int k_i = k0 + (lk0 + dk * kTileThreadsX);
             if (k_i >= sk) continue;
             scores[flat_i * sk + k_i] = s[di][dk] * inv_scale;
         }
@@ -1000,13 +1111,13 @@ mla_ctx_kernel(
     // Only the SMEM row indices live across the reduction — see the note in 3a: this
     // kernel is pinned at 64 registers too, so epilogue-only values are recomputed at
     // the bottom rather than held.
-    int lf[kTileReg], lr[kTileReg];
-    #pragma unroll
-    for (int di = 0; di < kTileReg; ++di)
-        lf[di] = threadIdx.y * kTileReg + di;
-    #pragma unroll
-    for (int dr = 0; dr < kTileReg; ++dr)
-        lr[dr] = threadIdx.x + dr * blockDim.x;
+    // Index bases; each element index is recomputed where it is used.
+    // lf(i) = lf0 + i and lr(j) = lr0 + j*kTileThreadsX are affine, so every SMEM
+    // access folds to a base register plus a compile-time immediate — the arrays cost no
+    // registers either way, but materialising them makes the epilogue emit redundant
+    // 64-bit address arithmetic (-264 SASS instructions in 3a when written this way).
+    const int lf0 = threadIdx.y * kTileReg;
+    const int lr0 = threadIdx.x;
 
 
     for (int k0 = k_begin; k0 < k_end; k0 += kCtxSkTile) {
@@ -1052,10 +1163,10 @@ mla_ctx_kernel(
                 acc_t attn_reg[kTileReg], ck_reg[kTileReg];
                 #pragma unroll
                 for (int di = 0; di < kTileReg; ++di)
-                    attn_reg[di] = attn_smem[lf[di] * kCtxSkPad + k_local];
+                    attn_reg[di] = attn_smem[(lf0 + di) * kCtxSkPad + k_local];
                 #pragma unroll
                 for (int dr = 0; dr < kTileReg; ++dr)
-                    ck_reg[dr] = ck_smem[lr[dr] * kCtxSkPad + k_local];
+                    ck_reg[dr] = ck_smem[(lr0 + dr * kTileThreadsX) * kCtxSkPad + k_local];
                 #pragma unroll
                 for (int di = 0; di < kTileReg; ++di)
                     #pragma unroll
@@ -1068,10 +1179,10 @@ mla_ctx_kernel(
                 acc_t attn_reg[kTileReg], ck_reg[kTileReg];
                 #pragma unroll
                 for (int di = 0; di < kTileReg; ++di)
-                    attn_reg[di] = attn_smem[lf[di] * kCtxSkPad + k_local];
+                    attn_reg[di] = attn_smem[(lf0 + di) * kCtxSkPad + k_local];
                 #pragma unroll
                 for (int dr = 0; dr < kTileReg; ++dr)
-                    ck_reg[dr] = ck_smem[lr[dr] * kCtxSkPad + k_local];
+                    ck_reg[dr] = ck_smem[(lr0 + dr * kTileThreadsX) * kCtxSkPad + k_local];
                 #pragma unroll
                 for (int di = 0; di < kTileReg; ++di)
                     #pragma unroll
@@ -1088,11 +1199,11 @@ mla_ctx_kernel(
     // them contributes exactly one atomic per element after its whole reduction.
     #pragma unroll
     for (int di = 0; di < kTileReg; ++di) {
-        const int flat_i = flat_base + lf[di];
+        const int flat_i = flat_base + (lf0 + di);
         if (flat_i >= flat_total) continue;
         #pragma unroll
         for (int dr = 0; dr < kTileReg; ++dr) {
-            const int r_i = r0 + lr[dr];
+            const int r_i = r0 + (lr0 + dr * kTileThreadsX);
             if (r_i >= kv_rank) continue;
             ctx_store(&ctx[flat_i * kv_rank + r_i], s[di][dr], use_atomic);
         }
@@ -1146,13 +1257,13 @@ mla_output_smem_kernel(
             s[db][dd] = acc_t(0);
 
     // Only the SMEM row indices live across the reduction (see the note in 3a).
-    int lb[kBqReg], ld[kTileReg];
-    #pragma unroll
-    for (int db = 0; db < kBqReg; ++db)
-        lb[db] = threadIdx.y * kBqReg + db;
-    #pragma unroll
-    for (int dd = 0; dd < kTileReg; ++dd)
-        ld[dd] = threadIdx.x + dd * blockDim.x;
+    // Index bases; each element index is recomputed where it is used.
+    // lb(i) = lb0 + i and ld(j) = ld0 + j*kTileThreadsX are affine, so every SMEM
+    // access folds to a base register plus a compile-time immediate — the arrays cost no
+    // registers either way, but materialising them makes the epilogue emit redundant
+    // 64-bit address arithmetic (-264 SASS instructions in 3a when written this way).
+    const int lb0 = threadIdx.y * kBqReg;
+    const int ld0 = threadIdx.x;
 
 
     for (int r0 = 0; r0 < kv_rank; r0 += kOutRankTile) {
@@ -1197,10 +1308,10 @@ mla_output_smem_kernel(
                 acc_t ctx_reg[kBqReg], w_reg[kTileReg];
                 #pragma unroll
                 for (int db = 0; db < kBqReg; ++db)
-                    ctx_reg[db] = ctx_smem[lb[db] * kOutRankPad + r_local];
+                    ctx_reg[db] = ctx_smem[(lb0 + db) * kOutRankPad + r_local];
                 #pragma unroll
                 for (int dd = 0; dd < kTileReg; ++dd)
-                    w_reg[dd] = w_smem[ld[dd] * kOutRankPad + r_local];
+                    w_reg[dd] = w_smem[(ld0 + dd * kTileThreadsX) * kOutRankPad + r_local];
                 #pragma unroll
                 for (int db = 0; db < kBqReg; ++db)
                     #pragma unroll
@@ -1213,10 +1324,10 @@ mla_output_smem_kernel(
                 acc_t ctx_reg[kBqReg], w_reg[kTileReg];
                 #pragma unroll
                 for (int db = 0; db < kBqReg; ++db)
-                    ctx_reg[db] = ctx_smem[lb[db] * kOutRankPad + r_local];
+                    ctx_reg[db] = ctx_smem[(lb0 + db) * kOutRankPad + r_local];
                 #pragma unroll
                 for (int dd = 0; dd < kTileReg; ++dd)
-                    w_reg[dd] = w_smem[ld[dd] * kOutRankPad + r_local];
+                    w_reg[dd] = w_smem[(ld0 + dd * kTileThreadsX) * kOutRankPad + r_local];
                 #pragma unroll
                 for (int db = 0; db < kBqReg; ++db)
                     #pragma unroll
@@ -1229,12 +1340,12 @@ mla_output_smem_kernel(
 
     #pragma unroll
     for (int db = 0; db < kBqReg; ++db) {
-        const int bq_i = bq_base + lb[db];
+        const int bq_i = bq_base + (lb0 + db);
         if (bq_i >= bq_total) continue;
         const int out_base = (bq_i * num_heads + head_idx) * v_dim;
         #pragma unroll
         for (int dd = 0; dd < kTileReg; ++dd) {
-            const int d_i = d_base + ld[dd];
+            const int d_i = d_base + (ld0 + dd * kTileThreadsX);
             if (d_i >= v_dim) continue;
             out[out_base + d_i] = static_cast<scalar_t>(s[db][dd]);
         }
@@ -1421,7 +1532,7 @@ torch::Tensor launch_mla_attention(
 // ============================================================================
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("q_absorbed", &launch_q_absorbed,
-          "Kernel 2 — fused Q path: x@W_q → absorb@W_uk + RoPE(Q_rope)");
+          "Kernel 2 — fused Q path: wq_b(RMSNorm(x@W_q_a)) → absorb@W_uk + RoPE(Q_rope)");
     m.def("mla_attention", &launch_mla_attention,
           "Kernel 3 — Official absorbed MLA: scores → softmax → ctx@c_kv → @W_uv");
 }

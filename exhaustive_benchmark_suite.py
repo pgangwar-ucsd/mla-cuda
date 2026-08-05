@@ -16,7 +16,7 @@ from __future__ import annotations
 import argparse
 import sys
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, List, NamedTuple, Optional
 
 import torch
 import mla_custom_cuda
@@ -234,22 +234,52 @@ DECODE_FOCUS_SCENARIOS = [s for s in PRODUCTION_SCENARIOS if s.name in DECODE_FO
 def apply_rope(x, positions, rope_dim):
     # in:  x [..., rope_dim=64]
     # pair-split: [..., 64] → even/odd [..., 32] each (adjacent pairs for RoPE)
+    # Angles in the kernel's acc dtype (fp64 in stays fp64), not an unconditional fp32:
+    # the angle is position * inv_freq, so at Sq=256 an fp32 angle costs ~6e-6 relative
+    # and the fp64 reference would be less accurate than the kernel it is checking.
+    acc = torch.float64 if x.dtype == torch.float64 else torch.float32
     freqs = 1.0 / (
         10000
-        ** (torch.arange(0, rope_dim, 2, device=x.device, dtype=torch.float32) / rope_dim)
+        ** (torch.arange(0, rope_dim, 2, device=x.device, dtype=acc) / rope_dim)
     )
-    pos = positions.to(device=x.device, dtype=torch.float32)
+    pos = positions.to(device=x.device, dtype=acc)
     angles = torch.outer(pos, freqs)  # [Sq, 32]
     cos = torch.cos(angles).to(dtype=x.dtype).view(1, -1, 1, rope_dim // 2)
     sin = torch.sin(angles).to(dtype=x.dtype).view(1, -1, 1, rope_dim // 2)
 
-    x_fp = x.float()
+    x_fp = x.to(acc)
     x_even = x_fp[..., 0::2]   # [..., 32]
     x_odd = x_fp[..., 1::2]    # [..., 32]
     out_even = x_even * cos - x_odd * sin
     out_odd = x_even * sin + x_odd * cos
     # merge pairs back: [..., 32, 2] → flatten → [..., 64]
     return torch.stack([out_even, out_odd], dim=-1).flatten(-2).type_as(x)
+
+
+class QProjection(NamedTuple):
+    """DeepSeek-V3 computes Q as wq_b(q_norm(wq_a(x))), factorising the 7168 → 24576
+    projection through a q_lora_rank=1536 latent instead of one dense matrix. That is
+    48.7M weights rather than 176M — 195 MB against 704 MB in fp32 — which is what
+    single-stream decode is bound by, since there Q-prep is a GEMV that touches every
+    weight exactly once. The RMSNorm is load-bearing: without it the two matmuls collapse
+    into a single rank-1536 matrix.
+    """
+
+    a: torch.Tensor       # [hidden, q_lora]
+    norm_w: torch.Tensor  # [q_lora]  RMSNorm gain
+    b: torch.Tensor       # [q_lora, H*qk_head_dim]
+
+
+RMS_NORM_EPS = 1e-6
+
+
+def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = RMS_NORM_EPS):
+    # Accumulate in the kernel's acc dtype, not an unconditional .float(): fp64 in must
+    # stay fp64 all the way through, or the reference is less accurate than the kernel
+    # it is checking.
+    acc = torch.float64 if x.dtype == torch.float64 else torch.float32
+    var = x.to(acc).pow(2).mean(-1, keepdim=True)
+    return (x.to(acc) * torch.rsqrt(var + eps)).to(x.dtype) * weight
 
 
 def split_wkv_b(wkv_b: torch.Tensor, cfg: DeepSeekV3Config):
@@ -259,12 +289,14 @@ def split_wkv_b(wkv_b: torch.Tensor, cfg: DeepSeekV3Config):
     return W_uk, W_uv
 
 
-def prepare_q_mla_absorbed(x, W_q, W_uk, q_positions, cfg: DeepSeekV3Config):
+def prepare_q_mla_absorbed(x, W_q: QProjection, W_uk, q_positions, cfg: DeepSeekV3Config):
     batch, sq, _ = x.shape
     n_heads = cfg.n_heads
 
-    # matmul: [B,Sq,7168] @ [7168, 128*(128+64)=24576] → [B,Sq,24576]
-    q_raw = torch.matmul(x, W_q)
+    # Q projection, factorised: [B,Sq,7168] @ [7168,1536] → RMSNorm → @ [1536,24576]
+    q_lat = torch.matmul(x, W_q.a)                        # [B,Sq,1536]
+    q_lat = rmsnorm(q_lat, W_q.norm_w)                    # [B,Sq,1536]
+    q_raw = torch.matmul(q_lat, W_q.b)                    # [B,Sq,24576]
     # reshape: [B,Sq,24576] → [B,Sq,128,192]
     q_raw = q_raw.view(batch, sq, n_heads, cfg.qk_head_dim)
     # split head dim: 192 → nope | rope
@@ -300,7 +332,7 @@ def mla_attention_official(q_absorbed, q_rope, c_kv, pe_cache, W_uv, cfg: DeepSe
 # CUDA fused versions of Q-prep and attention
 # ---------------------------------------------------------------------------
 
-def prepare_q_mla_absorbed_cuda(x, W_q, W_uk, q_positions, cfg: DeepSeekV3Config):
+def prepare_q_mla_absorbed_cuda(x, W_q: QProjection, W_uk, q_positions, cfg: DeepSeekV3Config):
     """Kernel 2: x[B,Sq,7168] → Q_absorbed[B,Sq,128,512], Q_rope[B,Sq,128,64].
 
     q_positions [Sq] holds the absolute position of each query and is required: in
@@ -308,8 +340,9 @@ def prepare_q_mla_absorbed_cuda(x, W_q, W_uk, q_positions, cfg: DeepSeekV3Config
     cannot derive it from the shape.
     """
     q_absorbed, q_rope = mla_custom_cuda.q_absorbed(
-        x, W_q.contiguous(), W_uk.contiguous(), q_positions,
-        cfg.qk_nope_head_dim, cfg.qk_rope_head_dim,
+        x, W_q.a.contiguous(), W_q.norm_w.contiguous(), W_q.b.contiguous(),
+        W_uk.contiguous(), q_positions,
+        cfg.qk_nope_head_dim, cfg.qk_rope_head_dim, RMS_NORM_EPS,
     )
     return q_absorbed, q_rope  # [B,Sq,128,512], [B,Sq,128,64]
 
@@ -342,10 +375,19 @@ def make_mla_tensors(scenario: BenchmarkScenario, cfg: DeepSeekV3Config, dtype=t
     pe_cache = torch.randn(batch, sk, cfg.qk_rope_head_dim, device=device, dtype=dtype)
     pe_cache = pe_cache * (1.0 / cfg.qk_rope_head_dim ** 0.5)
 
-    W_q = torch.randn(
-        cfg.hidden_dim, cfg.n_heads * cfg.qk_head_dim, device=device, dtype=dtype
+    # Q projection, factorised the way DeepSeek-V3 does it: 7168 → 1536 → 24576 with an
+    # RMSNorm on the latent. 1/sqrt(fan_in) on both keeps the chain O(1): the norm pins
+    # the latent to unit RMS, so q_raw lands at ~1 and scores at ~1/sqrt(192).
+    W_q_a = torch.randn(cfg.hidden_dim, cfg.q_lora_rank, device=device, dtype=dtype)
+    W_q_a = W_q_a * (1.0 / cfg.hidden_dim ** 0.5)
+    W_q_b = torch.randn(
+        cfg.q_lora_rank, cfg.n_heads * cfg.qk_head_dim, device=device, dtype=dtype
     )
-    W_q = W_q * (1.0 / cfg.hidden_dim ** 0.5)
+    W_q_b = W_q_b * (1.0 / cfg.q_lora_rank ** 0.5)
+    # Learned gain, initialised at 1 in the real model; jitter it so a kernel that drops
+    # the gain entirely still fails the correctness check.
+    q_norm_w = 1.0 + 0.1 * torch.randn(cfg.q_lora_rank, device=device, dtype=dtype)
+    W_q = QProjection(W_q_a, q_norm_w, W_q_b)
 
     # wkv_b [H, nope+v, kv_rank] — official reshape of Linear(kv_rank → H*(128+128))
     wkv_b = torch.randn(

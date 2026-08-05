@@ -19,8 +19,16 @@ equivalent PyTorch/cuBLAS ops:
 
 | Stage | Kernel | Computes |
 |---|---|---|
-| 2 | `q_absorbed` | `x @ W_q` → split nope/rope → absorb `@ W_uk` → RoPE on `Q_rope` |
+| 2 | `q_absorbed` | `W_q_b(RMSNorm(x @ W_q_a))` → split nope/rope → absorb `@ W_uk` → RoPE on `Q_rope` |
 | 3 | `mla_attention` | scores (`Q_absorbed @ c_kv^T + Q_rope @ pe_cache^T`) → softmax → `ctx = attn @ c_kv` → `out = ctx @ W_uv` |
+
+Kernel 2 runs 2a1 (`x @ W_q_a`) → 2a-norm → 2a2 (`@ W_q_b`) → 2b (RoPE) →
+2c (absorb). The Q projection is factorised through the `q_lora_rank = 1536`
+latent the way DeepSeek-V3 does it rather than as one dense `[7168, 24576]`
+matrix — 48.7M weights instead of 176M, or 195 MB against 704 MB in fp32.
+That dominates single-stream decode, where Q-prep is a GEMV that touches every
+weight exactly once. The RMSNorm is load-bearing: without it the two matmuls
+collapse into a single rank-1536 matrix.
 
 Kernel 3 internally runs sub-stages 3a (scores) → 3b (softmax) → 3c (ctx) →
 3d (output projection); see the comment block above `KERNEL 3` in
