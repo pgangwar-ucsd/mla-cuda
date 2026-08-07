@@ -65,6 +65,11 @@ static constexpr int kCtxFlatTile    = kTileThreadsY * kTileReg;  // 128 flats
 static constexpr int kCtxRankTile    = kTileThreadsX * kTileReg;  // 128 kv_rank out
 static constexpr int kCtxSkTile      = kTileRed;                  // reduce over Sk
 static constexpr int kCtxSkPad       = kTileRedPad;
+// `scores` rows are padded to a multiple of this many elements. A warp of 3a's epilogue
+// writes two runs of 16 contiguous elements, so a row whose stride is not a multiple of
+// a 128 B line starts every row at a different offset and those runs straddle 32 B
+// sectors. 
+static constexpr int kScoreRowAlign  = 32;
 
 // --- Kernel 2 (Q-prep) ------------------------------------------------------
 // Blocking over bq (not one block per (b,s,h)) is what keeps W_q traffic bounded: a
@@ -258,7 +263,7 @@ q_raw_gemm_kernel(
     // threadIdx.y → bq (the row), threadIdx.x → n (contiguous in q_raw), so a warp
     // stores two runs of 8 adjacent q_raw columns rather than scattering across rows.
     // SMEM row index bases, not arrays — see the note in 3a.
-    const int lb0 = threadIdx.y * kBqReg;
+    const int lb0 = threadIdx.y;
     const int ln0 = threadIdx.x;
 
     for (int k0 = k_begin; k0 < k_end; k0 += kQHiddenTile) {
@@ -301,7 +306,7 @@ q_raw_gemm_kernel(
                 acc_t x_reg[kBqReg], w_reg[kTileReg];
                 #pragma unroll
                 for (int db = 0; db < kBqReg; ++db)
-                    x_reg[db] = x_smem[(lb0 + db) * kQHiddenPad + k_local];
+                    x_reg[db] = x_smem[(lb0 + db * kTileThreadsY) * kQHiddenPad + k_local];
                 #pragma unroll
                 for (int dn = 0; dn < kTileReg; ++dn)
                     w_reg[dn] = w_smem[(ln0 + dn * kTileThreadsX) * kQHiddenPad + k_local];
@@ -317,7 +322,7 @@ q_raw_gemm_kernel(
                 acc_t x_reg[kBqReg], w_reg[kTileReg];
                 #pragma unroll
                 for (int db = 0; db < kBqReg; ++db)
-                    x_reg[db] = x_smem[(lb0 + db) * kQHiddenPad + k_local];
+                    x_reg[db] = x_smem[(lb0 + db * kTileThreadsY) * kQHiddenPad + k_local];
                 #pragma unroll
                 for (int dn = 0; dn < kTileReg; ++dn)
                     w_reg[dn] = w_smem[(ln0 + dn * kTileThreadsX) * kQHiddenPad + k_local];
@@ -337,7 +342,7 @@ q_raw_gemm_kernel(
     // them contributes exactly one atomic per element after its whole reduction.
     #pragma unroll
     for (int db = 0; db < kBqReg; ++db) {
-        const int bq_i = bq_base + (lb0 + db);
+        const int bq_i = bq_base + (lb0 + db * kTileThreadsY);
         if (bq_i >= bq_total) continue;
         const int row_base = bq_i * n_total;
         #pragma unroll
@@ -493,7 +498,7 @@ q_absorb_kernel(
 
     // Only the SMEM row indices live across the reduction (see 2a / 3a).
     // SMEM row index bases, not arrays — see the note in 3a.
-    const int lb0 = threadIdx.y * kBqReg;
+    const int lb0 = threadIdx.y;
     const int lr0 = threadIdx.x;
 
 
@@ -536,7 +541,7 @@ q_absorb_kernel(
                 acc_t qn_reg[kBqReg], w_reg[kTileReg];
                 #pragma unroll
                 for (int db = 0; db < kBqReg; ++db)
-                    qn_reg[db] = qn_smem[(lb0 + db) * kQNopePad + n_local];
+                    qn_reg[db] = qn_smem[(lb0 + db * kTileThreadsY) * kQNopePad + n_local];
                 #pragma unroll
                 for (int dr = 0; dr < kTileReg; ++dr)
                     w_reg[dr] = w_smem[(lr0 + dr * kTileThreadsX) * kQNopePad + n_local];
@@ -552,7 +557,7 @@ q_absorb_kernel(
                 acc_t qn_reg[kBqReg], w_reg[kTileReg];
                 #pragma unroll
                 for (int db = 0; db < kBqReg; ++db)
-                    qn_reg[db] = qn_smem[(lb0 + db) * kQNopePad + n_local];
+                    qn_reg[db] = qn_smem[(lb0 + db * kTileThreadsY) * kQNopePad + n_local];
                 #pragma unroll
                 for (int dr = 0; dr < kTileReg; ++dr)
                     w_reg[dr] = w_smem[(lr0 + dr * kTileThreadsX) * kQNopePad + n_local];
@@ -568,7 +573,7 @@ q_absorb_kernel(
 
     #pragma unroll
     for (int db = 0; db < kBqReg; ++db) {
-        const int bq_i = bq_base + (lb0 + db);
+        const int bq_i = bq_base + (lb0 + db * kTileThreadsY);
         if (bq_i >= bq_total) continue;
         const int out_base = (bq_i * num_heads + head_idx) * kv_rank;
         #pragma unroll
@@ -812,6 +817,7 @@ mla_scores_kernel(
     const scalar_t* __restrict__ pe_cache,   // [B, Sk, rope_dim=64]  head-shared
     acc_t_of<scalar_t>* __restrict__ scores, // [B, Sq, H, Sk]  in the accumulate dtype
     acc_t_of<scalar_t>* __restrict__ row_max, // [B*Sq*H] running row max, or nullptr
+    int score_stride,  // row stride of `scores`, >= sk and a multiple of kScoreRowAlign
     int batch_size,
     int sq,
     int sk,
@@ -861,7 +867,7 @@ mla_scores_kernel(
     // those are epilogue-only, and this kernel sits at exactly the 128-register budget
     // that 256 threads x 2 blocks/SM allows, so every value kept alive across the
     // reduction is a register the scheduler cannot use to prefetch the next operand.
-    const int lf0 = threadIdx.y * kTileReg;
+    const int lf0 = threadIdx.y;
     const int lk0 = threadIdx.x;
 
 
@@ -923,7 +929,7 @@ mla_scores_kernel(
                 acc_t qa_reg[kTileReg], ck_reg[kTileReg];
                 #pragma unroll
                 for (int di = 0; di < kTileReg; ++di)
-                    qa_reg[di] = qa_smem[(lf0 + di) * kScoreRankPad + r_local];
+                    qa_reg[di] = qa_smem[(lf0 + di * kTileThreadsY) * kScoreRankPad + r_local];
                 #pragma unroll
                 for (int dk = 0; dk < kTileReg; ++dk)
                     ck_reg[dk] = ck_smem[(lk0 + dk * kTileThreadsX) * kScoreRankPad + r_local];
@@ -939,7 +945,7 @@ mla_scores_kernel(
                 acc_t qa_reg[kTileReg], ck_reg[kTileReg];
                 #pragma unroll
                 for (int di = 0; di < kTileReg; ++di)
-                    qa_reg[di] = qa_smem[(lf0 + di) * kScoreRankPad + r_local];
+                    qa_reg[di] = qa_smem[(lf0 + di * kTileThreadsY) * kScoreRankPad + r_local];
                 #pragma unroll
                 for (int dk = 0; dk < kTileReg; ++dk)
                     ck_reg[dk] = ck_smem[(lk0 + dk * kTileThreadsX) * kScoreRankPad + r_local];
@@ -956,13 +962,13 @@ mla_scores_kernel(
     // Bounds are recomputed here rather than carried in registers through the loops.
     #pragma unroll
     for (int di = 0; di < kTileReg; ++di) {
-        const int flat_i = flat_base + (lf0 + di);
+        const int flat_i = flat_base + (lf0 + di * kTileThreadsY);
         if (flat_i >= flat_total) continue;
         #pragma unroll
         for (int dk = 0; dk < kTileReg; ++dk) {
             const int k_i = k0 + (lk0 + dk * kTileThreadsX);
             if (k_i >= sk) continue;
-            scores[flat_i * sk + k_i] = s[di][dk] * inv_scale;
+            scores[flat_i * score_stride + k_i] = s[di][dk] * inv_scale;
         }
     }
 
@@ -985,7 +991,7 @@ mla_scores_kernel(
             #pragma unroll
             for (int off = 1; off < kTileThreadsX; off <<= 1)
                 m = fmax(m, __shfl_xor_sync(0xffffffffu, m, off));
-            const int flat_i = flat_base + (lf0 + di);
+            const int flat_i = flat_base + (lf0 + di * kTileThreadsY);
             if (threadIdx.x == 0 && flat_i < flat_total && m != -INFINITY)
                 atomic_max_acc(&row_max[flat_i], m * inv_scale);
         }
@@ -1082,6 +1088,7 @@ mla_ctx_kernel(
     ctx_t*          __restrict__ ctx,   // [B, Sq, H, kv_rank]  unnormalised numerator
     const acc_t_of<scalar_t>* __restrict__ row_max,  // [B*Sq*H] from 3a, or nullptr
     acc_t_of<scalar_t>* __restrict__ row_sum,        // [B*Sq*H] softmax denominator out
+    int score_stride,  // row stride of `scores`; the pad columns are never touched
     int batch_size,
     int sq,
     int sk,
@@ -1126,7 +1133,7 @@ mla_ctx_kernel(
 
     // SMEM row index bases; see the note in 3a for why these are not arrays and why
     // epilogue-only values are recomputed at the bottom rather than kept alive.
-    const int lf0 = threadIdx.y * kTileReg;
+    const int lf0 = threadIdx.y;
     const int lr0 = threadIdx.x;
 
     const int tid = threadIdx.x + threadIdx.y * blockDim.x;
@@ -1162,7 +1169,7 @@ mla_ctx_kernel(
             const int flat_s  = flat_base + lf_s;
             if (flat_s < flat_total && k_local < tile_len)
                 p_smem[lf_s * kCtxSkPad + k_local] =
-                    scores[flat_s * sk + k0 + k_local];
+                    scores[flat_s * score_stride + k0 + k_local];
         }
 
         // stage c_kv[b, k0:k0+tile, r0:r0+128) — r contiguous → lr = idx % kRs
@@ -1205,7 +1212,7 @@ mla_ctx_kernel(
         // Rescale the running accumulator onto the new maximum.
         #pragma unroll
         for (int di = 0; di < kTileReg; ++di) {
-            const acc_t rs = resc_smem[lf0 + di];
+            const acc_t rs = resc_smem[lf0 + di * kTileThreadsY];
             #pragma unroll
             for (int dr = 0; dr < kTileReg; ++dr)
                 s[di][dr] *= rs;
@@ -1236,7 +1243,7 @@ mla_ctx_kernel(
                 acc_t p_reg[kTileReg], ck_reg[kTileReg];
                 #pragma unroll
                 for (int di = 0; di < kTileReg; ++di)
-                    p_reg[di] = p_smem[(lf0 + di) * kCtxSkPad + k_local];
+                    p_reg[di] = p_smem[(lf0 + di * kTileThreadsY) * kCtxSkPad + k_local];
                 #pragma unroll
                 for (int dr = 0; dr < kTileReg; ++dr)
                     ck_reg[dr] = ck_smem[(lr0 + dr * kTileThreadsX) * kCtxSkPad + k_local];
@@ -1252,7 +1259,7 @@ mla_ctx_kernel(
                 acc_t p_reg[kTileReg], ck_reg[kTileReg];
                 #pragma unroll
                 for (int di = 0; di < kTileReg; ++di)
-                    p_reg[di] = p_smem[(lf0 + di) * kCtxSkPad + k_local];
+                    p_reg[di] = p_smem[(lf0 + di * kTileThreadsY) * kCtxSkPad + k_local];
                 #pragma unroll
                 for (int dr = 0; dr < kTileReg; ++dr)
                     ck_reg[dr] = ck_smem[(lr0 + dr * kTileThreadsX) * kCtxSkPad + k_local];
@@ -1273,7 +1280,7 @@ mla_ctx_kernel(
     // them contributes exactly one atomic per element after its whole reduction.
     #pragma unroll
     for (int di = 0; di < kTileReg; ++di) {
-        const int flat_i = flat_base + (lf0 + di);
+        const int flat_i = flat_base + (lf0 + di * kTileThreadsY);
         if (flat_i >= flat_total) continue;
         #pragma unroll
         for (int dr = 0; dr < kTileReg; ++dr) {
@@ -1348,7 +1355,7 @@ mla_output_smem_kernel(
 
     // Only the SMEM row indices live across the reduction (see the note in 3a).
     // SMEM row index bases, not arrays — see the note in 3a.
-    const int lb0 = threadIdx.y * kBqReg;
+    const int lb0 = threadIdx.y;
     const int ld0 = threadIdx.x;
 
     // flat = bq*H + h, matching 3c's row indexing
@@ -1403,7 +1410,7 @@ mla_output_smem_kernel(
                 acc_t ctx_reg[kBqReg], w_reg[kTileReg];
                 #pragma unroll
                 for (int db = 0; db < kBqReg; ++db)
-                    ctx_reg[db] = ctx_smem[(lb0 + db) * kOutRankPad + r_local];
+                    ctx_reg[db] = ctx_smem[(lb0 + db * kTileThreadsY) * kOutRankPad + r_local];
                 #pragma unroll
                 for (int dd = 0; dd < kTileReg; ++dd)
                     w_reg[dd] = w_smem[(ld0 + dd * kTileThreadsX) * kOutRankPad + r_local];
@@ -1419,7 +1426,7 @@ mla_output_smem_kernel(
                 acc_t ctx_reg[kBqReg], w_reg[kTileReg];
                 #pragma unroll
                 for (int db = 0; db < kBqReg; ++db)
-                    ctx_reg[db] = ctx_smem[(lb0 + db) * kOutRankPad + r_local];
+                    ctx_reg[db] = ctx_smem[(lb0 + db * kTileThreadsY) * kOutRankPad + r_local];
                 #pragma unroll
                 for (int dd = 0; dd < kTileReg; ++dd)
                     w_reg[dd] = w_smem[(ld0 + dd * kTileThreadsX) * kOutRankPad + r_local];
@@ -1435,7 +1442,7 @@ mla_output_smem_kernel(
 
     #pragma unroll
     for (int db = 0; db < kBqReg; ++db) {
-        const int bq_i = bq_base + (lb0 + db);
+        const int bq_i = bq_base + (lb0 + db * kTileThreadsY);
         if (bq_i >= bq_total) continue;
         const int out_base = (bq_i * num_heads + head_idx) * v_dim;
         #pragma unroll
@@ -1491,8 +1498,14 @@ torch::Tensor launch_mla_attention(
     const int  ctx_sk_chunk = ctx_chunk_tiles * kCtxSkTile;
     const bool ctx_atomic   = ctx_split > 1;
 
-    auto scores = torch::empty({batch_size, sq, num_heads, sk},
-                               q_absorbed.options().dtype(acc_dtype));  // [B,Sq,128,Sk]
+    // Row stride padded up so every row of `scores` starts on a 128 B line — see
+    // kScoreRowAlign. The pad columns are never written or read: 3a stores under
+    // `k_i < sk` and 3c stages under `k_local < tile_len`, both bounded by the true Sk.
+    // At B=128, Sk=4989 this is 4992, costing 196 KB of the 327 MB tensor.
+    const int score_stride =
+        ((sk + kScoreRowAlign - 1) / kScoreRowAlign) * kScoreRowAlign;
+    auto scores = torch::empty({flat_total, score_stride},
+                               q_absorbed.options().dtype(acc_dtype));
     // ctx keeps the input dtype; only split-K promotes it to the accumulate dtype, since
     // combining the partials means read-modify-write via atomicAdd.
     auto ctx = torch::empty({batch_size, sq, num_heads, kv_rank},
@@ -1536,6 +1549,7 @@ torch::Tensor launch_mla_attention(
                 c_kv.data_ptr<scalar_t>(),       pe_cache.data_ptr<scalar_t>(),
                 scores.data_ptr<acc_t>(),
                 row_max.data_ptr<acc_t>(),
+                score_stride,
                 batch_size, sq, sk, num_heads, kv_rank, rope_dim,
                 static_cast<acc_t>(scale));
             C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1563,6 +1577,7 @@ torch::Tensor launch_mla_attention(
                     scores.data_ptr<acc_t>(), c_kv.data_ptr<scalar_t>(),
                     ctx.data_ptr<acc_t>(),
                     row_max.data_ptr<acc_t>(), row_sum.data_ptr<acc_t>(),
+                    score_stride,
                     batch_size, sq, sk, num_heads, kv_rank, ctx_sk_chunk, true);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
             } else {
@@ -1572,6 +1587,7 @@ torch::Tensor launch_mla_attention(
                     scores.data_ptr<acc_t>(), c_kv.data_ptr<scalar_t>(),
                     ctx.data_ptr<scalar_t>(),
                     row_max.data_ptr<acc_t>(), row_sum.data_ptr<acc_t>(),
+                    score_stride,
                     batch_size, sq, sk, num_heads, kv_rank, ctx_sk_chunk, false);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
             }
