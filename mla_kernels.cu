@@ -2,6 +2,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <math.h>
 #include <limits>
 
@@ -90,6 +91,10 @@ static constexpr int kRopeThreads = 256;
 // 2a-norm: one block per bq row over the q_lora latent (1536), so a single block
 // reduction covers the row and 256 threads is 6 elements each.
 static constexpr int kNormThreads = 256;
+// 3b combine: one WARP per row, so a block retires kCombineThreads/32 = 8 rows.
+// partials_per_row is ceil(Sk/kScoreSkTile) — 4 at Sk=512, 512 at Sk=65536 — and a
+// block per row spent two barriers to reduce as few as 4 numbers (see mla_combine_kernel).
+static constexpr int kCombineThreads = 256;
 
 // --- 3d ---------------------------------------------------------------------
 static constexpr int kOutVTile    = kTileThreadsX * kTileReg;  // 128 v_dim out
@@ -251,7 +256,7 @@ q_raw_gemm_kernel(
     acc_t* x_smem = smem;                            // [kBqTile][kQHiddenPad]
     acc_t* w_smem = x_smem + kBqTile * kQHiddenPad;  // [kQWqColTile][kQHiddenPad]
 
-    const int coop_stride = blockDim.x * blockDim.y;
+    const int coop_stride = kTileThreads;  // constexpr: lets the staging loops unroll
 
     acc_t s[kBqReg][kTileReg];
     #pragma unroll
@@ -275,7 +280,7 @@ q_raw_gemm_kernel(
         // rather than a runtime integer division; a short trailing tile is handled by
         // predicating the store.
         const int x_elems = kBqTile * kQHiddenTile;
-        for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
+        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
              idx < x_elems; idx += coop_stride) {
             const int lb_s    = idx / kQHiddenTile;
             const int k_local = idx % kQHiddenTile;
@@ -287,7 +292,7 @@ q_raw_gemm_kernel(
 
         // stage W_q[k0:+tile, n_base:+128) — n contiguous → ln_s = idx % kQWqColTile
         const int w_elems = tile_len * kQWqColTile;
-        for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
+        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
              idx < w_elems; idx += coop_stride) {
             const int k_local = idx / kQWqColTile;
             const int ln_s    = idx % kQWqColTile;
@@ -487,7 +492,7 @@ q_absorb_kernel(
 
     const int qn_head_base = head_idx * qk_head_dim;        // nope half starts at +0
     const int w_head_base  = head_idx * nope_dim * kv_rank;
-    const int coop_stride  = blockDim.x * blockDim.y;
+    const int coop_stride  = kTileThreads;  // constexpr: lets the staging loops unroll
 
     acc_t s[kBqReg][kTileReg];
     #pragma unroll
@@ -511,7 +516,7 @@ q_absorb_kernel(
         // rather than a runtime integer division; a short trailing tile is handled by
         // predicating the store. 
         const int qn_elems = kBqTile * kQNopeTile;
-        for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
+        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
              idx < qn_elems; idx += coop_stride) {
             const int lb_s    = idx / kQNopeTile;
             const int n_local = idx % kQNopeTile;
@@ -523,7 +528,7 @@ q_absorb_kernel(
 
         // stage W_uk[h, n0:+tile, r_base:+128) — r contiguous → lr_s = idx % kQRankTile
         const int w_elems = tile_len * kQRankTile;
-        for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
+        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
              idx < w_elems; idx += coop_stride) {
             const int n_local = idx / kQRankTile;
             const int lr_s    = idx % kQRankTile;
@@ -765,38 +770,25 @@ std::vector<torch::Tensor> launch_q_absorbed(
 //      one (kv_rank + rope_dim) = 576-deep reduction in SMEM tiles of 32:
 //        r <  512 draws from q_absorbed [B,Sq,H,512] and c_kv     [B,Sk,512]
 //        r >= 512 draws from q_rope     [B,Sq,H,64]  and pe_cache [B,Sk,64]
-//      then /sqrt(192); the epilogue also reduces each row's maximum into row_max
-//  3c. ctx, with the softmax folded in — same 16×16 / 8×8 shape as 3a
+//      then /sqrt(192); the epilogue exponentiates against this block's own row max
+//      and stores exp(s - m_b), plus (m_b, l_b) per row into m_part / l_part
+//  3b. combine — one warp per row, folding that row's partials_per_row softmax
+//      partials into M = max_j m_j, alpha_j = exp(m_j - M), row_sum = sum_j l_j*alpha_j.
+//      grid.y splits a row across blocks in 3a, so no block there can subtract the
+//      global maximum; this reconciles the local ones after the fact.
+//  3c. ctx — same 16×16 / 8×8 shape as 3a
 //      grid.x=flat, grid.y=kv_rank, grid.z=split-K over Sk
 //      128 flats × 128 ranks/block; Sk contracted in SMEM tiles of kCtxSkTile=32
-//      exp(scores - row_max) @ c_kv[B,Sk,512] → *unnormalised* ctx[B,Sq,H,512],
-//      plus the denominator row_sum[B*Sq*H]. There is no separate softmax pass: the
-//      numerator is formed on the 128×32 tile already sitting in SMEM, so the
-//      normalised attention matrix is never written to memory at all.
+//      (exp(s - m_b) * alpha) @ c_kv[B,Sk,512] → *unnormalised* ctx[B,Sq,H,512].
+//      The alpha factor rides the staging store, so what lands in SMEM is exp(s - M)
+//      and the Sk loop is stage → barrier → reduce → barrier with nothing between:
+//      no softmax pass, no per-tile max scan, no row-sum pass. The normalised
+//      attention matrix is never written to memory at all.
 //  3d. out — 16×16 threads, 8 v_dims × kBqReg bq/thread; grid.x=bq, .y=v, .z=head
 //      one head per block so W_uv[h] is staged once and reused across the bq tile
 //      (ctx[B,Sq,H,512] / row_sum) × W_uv[H,128,512] → out[B,Sq,H,128]
 //      the deferred softmax divide rides along on a staging load 3d already does
 // ============================================================================
-
-// Atomic max on a float/double, which CUDA provides no native instruction for.
-// IEEE-754 is sign-magnitude, so for a non-negative value the bit pattern read as a
-// signed integer orders identically to the float, and atomicMax on int does the job.
-// For a negative value the ordering inverts, but reading the pattern as *unsigned*
-// reverses it back — a larger float is a smaller unsigned — so atomicMin gets it.
-// Mixed signs work in both branches: positives have the high bit clear and so are
-// smaller unsigned than any negative, and larger signed than any negative.
-__device__ __forceinline__ void atomic_max_acc(float* addr, float v) {
-    if (v >= 0.0f) atomicMax(reinterpret_cast<int*>(addr), __float_as_int(v));
-    else           atomicMin(reinterpret_cast<unsigned int*>(addr), __float_as_uint(v));
-}
-__device__ __forceinline__ void atomic_max_acc(double* addr, double v) {
-    if (v >= 0.0)
-        atomicMax(reinterpret_cast<long long*>(addr), __double_as_longlong(v));
-    else
-        atomicMin(reinterpret_cast<unsigned long long*>(addr),
-                  static_cast<unsigned long long>(__double_as_longlong(v)));
-}
 
 // --- 3a. scores: 8×8 output tile per thread; grid (flat B*Sq*H, Sk) ---
 //   grid.x: flat = b*(Sq*128) + q*128 + h     ∈ [0, B*Sq*128)  — 128 flats/block
@@ -815,8 +807,10 @@ mla_scores_kernel(
     const scalar_t* __restrict__ q_rope,     // [B, Sq, H, rope_dim=64]
     const scalar_t* __restrict__ c_kv,       // [B, Sk, kv_rank=512]
     const scalar_t* __restrict__ pe_cache,   // [B, Sk, rope_dim=64]  head-shared
-    acc_t_of<scalar_t>* __restrict__ scores, // [B, Sq, H, Sk]  in the accumulate dtype
-    acc_t_of<scalar_t>* __restrict__ row_max, // [B*Sq*H] running row max, or nullptr
+    acc_t_of<scalar_t>* __restrict__ scores, // [B,Sq,H,Sk] exp(s - m_b), accumulate dtype
+    acc_t_of<scalar_t>* __restrict__ m_part, // [B*Sq*H][partials_per_row] this block's row max
+    acc_t_of<scalar_t>* __restrict__ l_part, // [B*Sq*H][partials_per_row] its sum of exp(s-m_b)
+    int partials_per_row,  // gridDim.y — row stride of m_part / l_part
     int score_stride,  // row stride of `scores`, >= sk and a multiple of kScoreRowAlign
     int batch_size,
     int sq,
@@ -844,7 +838,7 @@ mla_scores_kernel(
     const int ck_batch_stride = batch_idx * sk * kv_rank;
     const int pe_batch_stride = batch_idx * sk * rope_dim;
 
-    const int coop_stride = blockDim.x * blockDim.y;
+    const int coop_stride = kTileThreads;  // constexpr: lets the staging loops unroll
     const acc_t inv_scale = acc_t(1) / scale;
 
     // Per-thread output tile; rope later accumulates into the same regs
@@ -892,7 +886,7 @@ mla_scores_kernel(
 
         // stage the q side → qa_smem[lf][r^lf]
         // both sources are contiguous in r → r_local must be idx% so warps coalesce
-        for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
+        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
              idx < stage_elems_q; idx += coop_stride) {
             const int lf_s    = idx / kScoreRankTile;
             const int r_local = idx % kScoreRankTile;
@@ -905,7 +899,7 @@ mla_scores_kernel(
         }
 
         // stage the k side → ck_smem[lk][r^lk] (contiguous in r either way)
-        for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
+        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
              idx < stage_elems_k; idx += coop_stride) {
             const int lk_s    = idx / kScoreRankTile;
             const int r_local = idx % kScoreRankTile;
@@ -959,42 +953,115 @@ mla_scores_kernel(
         __syncthreads();  // all reads done before the next tile overwrites SMEM
     }
 
-    // Bounds are recomputed here rather than carried in registers through the loops.
+    // Epilogue: exponentiate here rather than in 3c. This block owns only kScoreSkTile of
+    // the row, so the global maximum is not knowable yet — but exp(s - M) factors as
+    // exp(s - m_b) * exp(m_b - M) for *any* m_b, so store the first factor against this
+    // block's own maximum and let the combine kernel supply the second. Doing it here is
+    // what removes the exponentials from 3c, where every score is staged once per rank
+    // tile and so exponentiated kv_rank/kCtxRankTile times over.
+    //
+    // Three steps per row, all on values already in registers:
+    //   1. m_b — reduce this thread's 8 keys, then the 16 threadIdx.x lanes that share
+    //      the row. inv_scale is applied *before* the max now (it was folded into the
+    //      store before), since the stored value is exponentiated against it.
+    //   2. store exp(s*inv_scale - m_b), accumulating l_b as it goes — the sum is free
+    //      because the exponentials are computed for the store regardless.
+    //   3. one plain store each of m_b and l_b. No atomicMax: the combine kernel derives
+    //      the global maximum from m_part, which also drops ~partials_per_row atomics/row.
+    acc_t m_b[kTileReg];
     #pragma unroll
     for (int di = 0; di < kTileReg; ++di) {
-        const int flat_i = flat_base + (lf0 + di * kTileThreadsY);
-        if (flat_i >= flat_total) continue;
+        acc_t m = -INFINITY;
         #pragma unroll
         for (int dk = 0; dk < kTileReg; ++dk) {
             const int k_i = k0 + (lk0 + dk * kTileThreadsX);
-            if (k_i >= sk) continue;
-            scores[flat_i * score_stride + k_i] = s[di][dk] * inv_scale;
+            if (k_i < sk) m = fmax(m, s[di][dk] * inv_scale);
         }
+        // threadIdx.x is the low 4 bits of the lane id (blockDim.x == 16), so an XOR
+        // butterfly up to 8 stays inside the 16 lanes that share these flats.
+        #pragma unroll
+        for (int off = 1; off < kTileThreadsX; off <<= 1)
+            m = fmax(m, __shfl_xor_sync(0xffffffffu, m, off));
+        m_b[di] = m;  // every lane holds it after the butterfly, so no SMEM is needed
     }
 
-    // Row maxima for 3c, computed here because the values are already in registers — a
-    // separate pass would have to re-read the whole scores tensor. Each
-    // thread holds 8 keys of 8 flats, so reduce over its keys, then across the 16
-    // threadIdx.x lanes sharing those flats, then one atomic per flat per block.
-    // inv_scale > 0, so scaling after the max is the same as scaling before it.
-    if (row_max != nullptr) {
+    // Bounds are recomputed here rather than carried in registers through the loops.
+    #pragma unroll
+    for (int di = 0; di < kTileReg; ++di) {
+        const int  flat_i = flat_base + (lf0 + di * kTileThreadsY);
+        // Not an early `continue`: flat_i follows threadIdx.y, and a warp spans two
+        // threadIdx.y groups, so skipping the loop body would leave the butterfly below
+        // executing on half a warp under a full mask. Predicate the store instead.
+        const bool row_ok = flat_i < flat_total;
+        const acc_t m = m_b[di];
+        acc_t l = acc_t(0);
         #pragma unroll
-        for (int di = 0; di < kTileReg; ++di) {
-            acc_t m = -INFINITY;
-            #pragma unroll
-            for (int dk = 0; dk < kTileReg; ++dk) {
-                const int k_i = k0 + (lk0 + dk * kTileThreadsX);
-                if (k_i < sk) m = fmax(m, s[di][dk]);
-            }
-            // threadIdx.x is the low 4 bits of the lane id (blockDim.x == 16), so an XOR
-            // butterfly up to 8 stays inside the 16 lanes that share these flats.
-            #pragma unroll
-            for (int off = 1; off < kTileThreadsX; off <<= 1)
-                m = fmax(m, __shfl_xor_sync(0xffffffffu, m, off));
-            const int flat_i = flat_base + (lf0 + di * kTileThreadsY);
-            if (threadIdx.x == 0 && flat_i < flat_total && m != -INFINITY)
-                atomic_max_acc(&row_max[flat_i], m * inv_scale);
+        for (int dk = 0; dk < kTileReg; ++dk) {
+            const int k_i = k0 + (lk0 + dk * kTileThreadsX);
+            if (!row_ok || k_i >= sk) continue;
+            // m is this row's max over the whole block, so the argument is <= 0 and the
+            // result is in (0, 1] — no overflow, and less underflow than exp(s - M) would
+            // give, since m_b <= M. The combine kernel scales back down by exp(m_b - M).
+            const acc_t p = exp(s[di][dk] * inv_scale - m);
+            scores[flat_i * score_stride + k_i] = p;
+            l += p;
         }
+        // l is this thread's 8 keys; reduce over the 16 lanes sharing the row, as above.
+        #pragma unroll
+        for (int off = 1; off < kTileThreadsX; off <<= 1)
+            l += __shfl_xor_sync(0xffffffffu, l, off);
+        if (threadIdx.x == 0 && row_ok) {
+            m_part[flat_i * partials_per_row + blockIdx.y] = m;
+            l_part[flat_i * partials_per_row + blockIdx.y] = l;
+        }
+    }
+}
+
+// One WARP per row, not one block. partials_per_row is ceil(Sk/kScoreSkTile) 
+template <typename acc_t>
+__global__ void __launch_bounds__(kCombineThreads)
+mla_combine_kernel(
+    const acc_t* __restrict__ m_part,  // [flat_total][partials_per_row]
+    const acc_t* __restrict__ l_part,  // [flat_total][partials_per_row]
+    acc_t* __restrict__ alpha,         // [flat_total][partials_per_row]  exp(m_j - M)
+    acc_t* __restrict__ row_sum,       // [flat_total]                the denominator
+    int flat_total,
+    int partials_per_row)
+{
+    constexpr int kWarps = kCombineThreads / 32;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    // Grid-stride so the launch stays bounded when flat_total is in the hundreds of
+    // thousands; every warp in the block walks its own row independently.
+    for (int flat = blockIdx.x * kWarps + warp; flat < flat_total;
+         flat += gridDim.x * kWarps) {
+        const acc_t* __restrict__ m_row = m_part + static_cast<size_t>(flat) * partials_per_row;
+        const acc_t* __restrict__ l_row = l_part + static_cast<size_t>(flat) * partials_per_row;
+        acc_t*       __restrict__ a_row = alpha  + static_cast<size_t>(flat) * partials_per_row;
+
+        // pass 1: M = max_j m_j.  Lanes stride the row, so the loads coalesce.
+        acc_t m = -INFINITY;
+        for (int j = lane; j < partials_per_row; j += 32) m = fmax(m, m_row[j]);
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            m = fmax(m, __shfl_xor_sync(0xffffffffu, m, off));
+
+        // pass 2: alpha_j, and L = sum_j l_j * alpha_j in the same sweep
+        acc_t l = acc_t(0);
+        for (int j = lane; j < partials_per_row; j += 32) {
+            // m_j == m covers the common case and the all-empty one, where -inf - -inf
+            // would be NaN. A finite m with m_j == -inf correctly yields alpha 0.
+            const acc_t mj = m_row[j];
+            const acc_t a  = (mj == m) ? acc_t(1) : exp(mj - m);
+            a_row[j] = a;
+            l += l_row[j] * a;
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            l += __shfl_xor_sync(0xffffffffu, l, off);
+
+        if (lane == 0) row_sum[flat] = l;
     }
 }
 
@@ -1016,43 +1083,50 @@ __device__ __forceinline__ void ctx_store(double* dst, double v, bool use_atomic
     else            *dst = v;
 }
 
-// --- 3c (+3b fused). ctx = softmax(scores) @ c_kv — flash-style online softmax ---
+// --- 3c. ctx = softmax(scores) @ c_kv, with the softmax already done elsewhere ---
 //
 // WHAT THIS COMPUTES.  For every row flat = (b, q, h), of which there are
 // flat_total = B*Sq*H:
 //
-//     s   = scores[flat, 0:Sk]          raw logits from 3a, already scaled by 1/sqrt(192)
-//     p   = exp(s - max(s))             softmax numerator, max subtracted for stability
+//     p   = exp(s - M)                  softmax numerator on the global scale
 //     ctx = (p @ c_kv[b]) / sum(p)      attention output for that row
 //
-// The divide is *not* done here — this kernel emits the unnormalised numerator
-// `p @ c_kv` plus the scalar denominator sum(p) per row, and 3d applies the divide while
-// it stages ctx. That is free there (one multiply by a precomputed reciprocal) and it
-// keeps the split-K partials addable.
+// Neither the exponential nor the denominator is computed here. 3a stores
+// exp(s - m_b) against its own block-local maximum and 3b turns the per-block partials
+// into alpha = exp(m_b - M); multiplying the two during staging gives exp(s - M)
+// termwise, so what lands in SMEM is already the numerator. This kernel is therefore a
+// plain [128 x Sk] @ [Sk x 128] matmul with a scale folded into its staging store.
+//
+// The divide is *not* done here either — this kernel emits the unnormalised numerator
+// `p @ c_kv`, and 3d applies the divide by row_sum while it stages ctx. That is free
+// there (one multiply by a precomputed reciprocal) and it keeps the split-K partials
+// addable.
 //
 // MATRIX DIMENSIONS.  Whole-tensor shapes, and the tile each block contracts:
 //
 //   in   scores   [B, Sq, H, Sk]         tile [kCtxFlatTile=128 flats][kCtxSkTile=32 keys]
 //   in   c_kv     [B, Sk, kv_rank=512]   tile [kCtxRankTile=128 ranks][kCtxSkTile=32 keys]
+//   in   alpha    [B*Sq*H][partials_per_row] exp(m_b - M), one per row per 3a Sk tile
 //   out  ctx      [B, Sq, H, kv_rank]    tile [128 flats][128 ranks], held in registers
-//   out  row_sum  [B*Sq*H]               the sum(p) denominator, consumed by 3d
-//   in   row_max  [B*Sq*H]               per-row max of the logits, from 3a
 //
 // So one block evaluates  [128 x Sk] @ [Sk x 128] -> [128 x 128], walking Sk in 32-wide
 // tiles and contracting 128 x 128 x 32 per tile. Per thread that is an 8x8 output tile
 // fed by 8 + 8 SMEM loads per 64 FMAs = 0.25 loads/FMA, the sm_86 balance point.
 //   grid.x: flat = b*(Sq*H) + q*H + h     — 128 flats/block
-//   grid.y: r ∈ [0, kv_rank)              — 128 ranks/block
+//   grid.y: r in [0, kv_rank)             — 128 ranks/block
 //   grid.z: split-K slice over Sk — see below
 //   block: 16×16 threads; threadIdx.x owns r (contiguous in `ctx`), threadIdx.y owns
 //   flat — same as 3a, so the epilogue is one 128 B transaction
 //   SMEM [lf][k] / [lr][k] padded to kCtxSkPad; scores staged k-fast, c_kv r-fast
 //
-// ONLINE (FLASH) SOFTMAX.  The true row maximum is not known until all of Sk has been
-// read, so each tile folds its own maximum into a running m and rescales the
-// accumulator by exp(m_old - m_new) whenever m grows; the denominator l is rescaled the
-// same way. Only the ratio ctx/l ever leaves this kernel, and that ratio is invariant to
-// the choice of m, so no renormalisation pass is needed at the end.
+// WHY THE SOFTMAX LEFT THIS KERNEL.  It used to run the textbook flash formulation here
+// — a running maximum per row, an accumulator rescale by exp(m_old - m_new), and an
+// in-place exponentiate-and-sum pass over each staged tile. Every one of those was work
+// this kernel repeated kv_rank/kCtxRankTile = 4 times, once per rank tile, because the
+// staged scores depend only on (flat, k0) and not on blockIdx.y. Moving it into 3a,
+// which sees each score exactly once, removed that 4x redundancy along with two passes
+// over the tile and two of the four per-tile barriers. What is left between staging and
+// the reduction is nothing at all.
 //
 //   Split-K: the grid only parallelises the output dims (flat × kv_rank), so a
 //   single-stream decode (B=Sq=1 → 128 flats) yields just 1×4 = 4 blocks and leaves
@@ -1064,30 +1138,17 @@ __device__ __forceinline__ void ctx_store(double* dst, double v, bool use_atomic
 //   ctx_t is the input dtype on the plain path and the accumulate dtype on the split-K
 //   path (see ctx_store): read-modify-write accumulation never narrows.
 //
-//   row_max and the softmax: 3a hands this kernel the maximum of each row, always,
-//   and that serves two distinct purposes.
-//
-//   It is *required* whenever gridDim.z > 1. A slice sees only its own span of Sk, so a
-//   maximum discovered online would differ between slices, their numerators would be on
-//   different scales, and the partials could not simply be added. A shared maximum is
-//   what lets the atomicAdd epilogue above stay as it is, with no per-slice buffers and
-//   no combine pass.
-//
-//   It is *profitable* on every path, including gridDim.z == 1. Nothing can raise a
-//   maximum that is already the maximum over all of Sk, so the per-tile scan and the
-//   accumulator rescale below are provably dead work and are branched around, taking
-//   one of the four per-tile barriers with them. Measured 3c -2.7% against 3a +0.7%.
-//
-//   The online path (row_max == nullptr) is kept because it is the formulation that
-//   makes this kernel correct on its own, without 3a's cooperation.
+//   Split-K needs no special handling for the softmax any more. Every slice stages
+//   values already on the global scale M, so the partials are addable by construction —
+//   which is what previously required feeding this kernel a precomputed row maximum.
 template <typename scalar_t, typename ctx_t>
 __global__ void __launch_bounds__(kTileThreads, kTileBlocksPerSM)
 mla_ctx_kernel(
-    const acc_t_of<scalar_t>* __restrict__ scores,  // [B, Sq, H, Sk] raw logits from 3a
+    const acc_t_of<scalar_t>* __restrict__ scores,  // [B,Sq,H,Sk] exp(s - m_b) from 3a
     const scalar_t* __restrict__ c_kv,  // [B, Sk, kv_rank]
     ctx_t*          __restrict__ ctx,   // [B, Sq, H, kv_rank]  unnormalised numerator
-    const acc_t_of<scalar_t>* __restrict__ row_max,  // [B*Sq*H] from 3a, or nullptr
-    acc_t_of<scalar_t>* __restrict__ row_sum,        // [B*Sq*H] softmax denominator out
+    const acc_t_of<scalar_t>* __restrict__ alpha,  // [B*Sq*H][partials_per_row] exp(m_b - M)
+    int partials_per_row,  // row stride of `alpha`, == 3a's gridDim.y
     int score_stride,  // row stride of `scores`; the pad columns are never touched
     int batch_size,
     int sq,
@@ -1108,21 +1169,17 @@ mla_ctx_kernel(
     const int k_end   = min(k_begin + sk_chunk, sk);
 
     acc_t* smem      = dynamic_smem<acc_t>();
-    // holds the raw logits after staging, then exp(s - m) in place after pass B
+    // holds exp(s - M) directly: 3a stored exp(s - m_b) and staging folds in exp(m_b - M)
     acc_t* p_smem  = smem;                                // [kCtxFlatTile][kCtxSkTile]
     acc_t* ck_smem = p_smem + kCtxFlatTile * kCtxSkPad;   // [kCtxRankTile][kCtxSkPad]
-    // Softmax state, one entry per flat row of the tile. Kept in SMEM rather than in
-    // registers because the thread that scans a row here is not the thread that owns it
-    // in the 8x8 compute tile, and registers are already at the 128 budget.
-    acc_t* m_smem    = ck_smem + kCtxRankTile * kCtxSkPad;  // running row maximum
-    acc_t* l_smem    = m_smem + kCtxFlatTile;               // running row denominator
-    acc_t* resc_smem = l_smem + kCtxFlatTile;               // exp(m_old - m_new) this tile
+    // No softmax state: 3a owns the exponentials and 3b the denominator, so the running
+    // (max, sum, rescale) triple and both passes over the staged tile are gone with them.
 
     // one batch per block when flat tile does not cross Sq*H (true for H=128, tile=64)
     const int batch_idx = min(flat_base, max(flat_total - 1, 0)) / (sq * num_heads);
     const int ck_batch_stride = batch_idx * sk * kv_rank;
 
-    const int coop_stride = blockDim.x * blockDim.y;
+    const int coop_stride = kTileThreads;  // constexpr: lets the staging loops unroll
 
     acc_t s[kTileReg][kTileReg];
     #pragma unroll
@@ -1136,45 +1193,44 @@ mla_ctx_kernel(
     const int lf0 = threadIdx.y;
     const int lr0 = threadIdx.x;
 
-    const int tid = threadIdx.x + threadIdx.y * blockDim.x;
-
-    // Seed the softmax state from the maximum 3a already reduced. Every slice then
-    // starts on the same scale, and no tile can raise it, so the loop below skips the
-    // scan and the rescale entirely. Passing nullptr instead falls back to discovering
-    // the maximum online, which is the textbook flash formulation and is kept because
-    // it is what makes this kernel correct without 3a's cooperation.
-    for (int f = tid; f < kCtxFlatTile; f += coop_stride) {
-        const int flat_s = flat_base + f;
-        m_smem[f] = (row_max != nullptr && flat_s < flat_total)
-                        ? row_max[flat_s] : -INFINITY;
-        l_smem[f] = acc_t(0);
-        resc_smem[f] = acc_t(1);   // stays 1 whenever the maximum is precomputed
-    }
-    __syncthreads();
+    const int tid = threadIdx.x + threadIdx.y * kTileThreadsX;
 
     for (int k0 = k_begin; k0 < k_end; k0 += kCtxSkTile) {
         const int tile_len =
             (k0 + kCtxSkTile <= k_end) ? kCtxSkTile : (k_end - k0);
 
-        // stage the raw logits scores[flat, k0:k0+tile) — k contiguous so warps
-        // coalesce. Pass B below overwrites them in place with exp(s - m).
+        // stage exp(s - m_b) from 3a and fold in exp(m_b - M) as it lands, which leaves
+        // exp(s - M) in SMEM — the numerator, ready to reduce, with no exponential and
+        // no read-modify-write pass over the tile anywhere in this kernel.
+        //
+        // The partial index is uniform across the tile: k0 is always a multiple of
+        // kCtxSkTile and kScoreSkTile is a multiple of that, so a tile never straddles two
+        // of 3a's blocks. alpha is read straight from global rather than staged: only
+        // kCtxFlatTile distinct values are live per tile and the threads sharing an lf_s
+        // all hit the same address, so it stays resident in L1 — staging it would cost a
+        // barrier, and the multiply must stay here rather than move into the reduction:
+        // register blocking re-reads each staged value 8 times, so folding it into the
+        // k loop instead would cost 16x the multiplies (measured +2% on this kernel).
+        //
         // Full-tile extent, not tile_len, so the div/mod fold to shift and mask
         // rather than a runtime integer division; a short trailing tile is handled by
         // predicating the store.
+        const int partial_idx = k0 / kScoreSkTile;
         const int stage_elems = kCtxFlatTile * kCtxSkTile;
-        for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
+        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
              idx < stage_elems; idx += coop_stride) {
             const int lf_s    = idx / kCtxSkTile;
             const int k_local = idx % kCtxSkTile;
             const int flat_s  = flat_base + lf_s;
             if (flat_s < flat_total && k_local < tile_len)
                 p_smem[lf_s * kCtxSkPad + k_local] =
-                    scores[flat_s * score_stride + k0 + k_local];
+                    scores[flat_s * score_stride + k0 + k_local]
+                    * alpha[flat_s * partials_per_row + partial_idx];
         }
 
         // stage c_kv[b, k0:k0+tile, r0:r0+128) — r contiguous → lr = idx % kRs
         const int ck_elems = tile_len * kCtxRankTile;
-        for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
+        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
              idx < ck_elems; idx += coop_stride) {
             const int k_local = idx / kCtxRankTile;
             const int lr_s    = idx % kCtxRankTile;
@@ -1186,53 +1242,10 @@ mla_ctx_kernel(
         }
         __syncthreads();
 
-        // ---- online softmax over this Sk tile -------------------------------------
-        // A precomputed row_max is already the maximum over all of Sk, so no tile can
-        // raise it: every rescale would be exactly 1 and Pass A's scan would be
-        // discarded. Skip both, and one of the barriers with them. Uniform across the
-        // block (row_max is a kernel argument), so the __syncthreads inside is safe.
-        if (row_max == nullptr) {
-        // Pass A: this tile's row maxima, folded into the running maxima. One thread per
-        // flat row; the row is 32 wide and rows are kCtxSkPad apart, so consecutive
-        // threads land on consecutive banks.
-        for (int f = tid; f < kCtxFlatTile; f += coop_stride) {
-            acc_t tmax = -INFINITY;
-            for (int k = 0; k < tile_len; ++k)
-                tmax = fmax(tmax, p_smem[f * kCtxSkPad + k]);
-            const acc_t m_old = m_smem[f];
-            const acc_t m_new = fmax(m_old, tmax);
-            // m_old == m_new covers both "maximum did not grow" and the all-empty case,
-            // where -inf - -inf would be NaN. Otherwise m_new is finite and a -inf m_old
-            // gives exp(-inf) == 0, correctly zeroing an accumulator that holds nothing.
-            resc_smem[f] = (m_old == m_new) ? acc_t(1) : exp(m_old - m_new);
-            m_smem[f]    = m_new;
-        }
-        __syncthreads();
-
-        // Rescale the running accumulator onto the new maximum.
-        #pragma unroll
-        for (int di = 0; di < kTileReg; ++di) {
-            const acc_t rs = resc_smem[lf0 + di * kTileThreadsY];
-            #pragma unroll
-            for (int dr = 0; dr < kTileReg; ++dr)
-                s[di][dr] *= rs;
-        }
-        }  // row_max == nullptr
-
-        // Pass B: exponentiate the tile in place so the reduction below is unchanged,
-        // and fold this tile's row sums into the running denominator.
-        for (int f = tid; f < kCtxFlatTile; f += coop_stride) {
-            const acc_t m_new = m_smem[f];
-            acc_t sum = acc_t(0);
-            for (int k = 0; k < tile_len; ++k) {
-                const acc_t p = exp(p_smem[f * kCtxSkPad + k] - m_new);
-                p_smem[f * kCtxSkPad + k] = p;
-                sum += p;
-            }
-            l_smem[f] = l_smem[f] * resc_smem[f] + sum;
-        }
-        __syncthreads();
-        // ---------------------------------------------------------------------------
+        // p_smem already holds exp(s - M), so the two passes that used to sit here — the
+        // per-tile max scan with its accumulator rescale, and the in-place exponentiate
+        // plus row-sum — are both gone, along with a barrier each. What remains between
+        // staging and the reduction is nothing at all.
 
         // k-outer register strip: 8 p + 8 ck SMEM loads feed 64 FMAs (0.25 loads/FMA).
         // Lanes past flat_total / kv_rank read unwritten SMEM; dropped at the store.
@@ -1274,7 +1287,7 @@ mla_ctx_kernel(
     }
 
     // Each grid.z slice owns a disjoint span of Sk, so the partials are a plain sum —
-    // they share a common maximum via row_max, so the numerators are on the same scale.
+    // they already share the global maximum M, so the numerators are on one scale.
     // Lanes of a warp differ in `flat`, so these hit distinct cache lines; the only
     // contention is between the gridDim.z blocks sharing an output tile, and each of
     // them contributes exactly one atomic per element after its whole reduction.
@@ -1287,17 +1300,6 @@ mla_ctx_kernel(
             const int r_i = r0 + (lr0 + dr * kTileThreadsX);
             if (r_i >= kv_rank) continue;
             ctx_store(&ctx[flat_i * kv_rank + r_i], s[di][dr], use_atomic);
-        }
-    }
-
-    // The denominator depends only on (flat, Sk slice), not on the rank tile, so all
-    // gridDim.y blocks of a slice compute the same value — only the first writes it.
-    if (blockIdx.y == 0) {
-        for (int f = tid; f < kCtxFlatTile; f += coop_stride) {
-            const int flat_s = flat_base + f;
-            if (flat_s >= flat_total) continue;
-            if (use_atomic) atomicAdd(&row_sum[flat_s], l_smem[f]);
-            else            row_sum[flat_s] = l_smem[f];
         }
     }
 }
@@ -1344,7 +1346,7 @@ mla_output_smem_kernel(
     // ctx[bq, h, r] and W_uv[h, d, r] are both contiguous in r
     const int ctx_head_base = head_idx * kv_rank;
     const int w_head_base   = head_idx * v_dim * kv_rank;
-    const int coop_stride   = blockDim.x * blockDim.y;
+    const int coop_stride   = kTileThreads;  // constexpr: lets the staging loops unroll
 
     acc_t s[kBqReg][kTileReg];
     #pragma unroll
@@ -1359,7 +1361,7 @@ mla_output_smem_kernel(
     const int ld0 = threadIdx.x;
 
     // flat = bq*H + h, matching 3c's row indexing
-    for (int i = threadIdx.x + threadIdx.y * blockDim.x; i < kBqTile; i += coop_stride) {
+    for (int i = threadIdx.x + threadIdx.y * kTileThreadsX; i < kBqTile; i += coop_stride) {
         const int bq_s = bq_base + i;
         inv_l_smem[i] = (bq_s < bq_total)
             ? acc_t(1) / row_sum[bq_s * num_heads + head_idx]
@@ -1376,7 +1378,7 @@ mla_output_smem_kernel(
         // rather than a runtime integer division; a short trailing tile is handled by
         // predicating the store. Measured 26% off mla_scores_kernel.
         const int ctx_elems = kBqTile * kOutRankTile;
-        for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
+        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
              idx < ctx_elems; idx += coop_stride) {
             const int lb_s    = idx / kOutRankTile;
             const int r_local = idx % kOutRankTile;
@@ -1390,7 +1392,7 @@ mla_output_smem_kernel(
 
         // stage W_uv[h, d_base:+128, r0:+tile) — reused by every bq in this block
         const int w_elems = kOutVTile * kOutRankTile;
-        for (int idx = threadIdx.x + threadIdx.y * blockDim.x;
+        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
              idx < w_elems; idx += coop_stride) {
             const int ld_s    = idx / kOutRankTile;
             const int r_local = idx % kOutRankTile;
@@ -1512,21 +1514,18 @@ torch::Tensor launch_mla_attention(
                             ctx_atomic ? q_absorbed.options().dtype(acc_dtype)
                                        : q_absorbed.options());                        // [B,Sq,128,512]
     auto out = torch::empty({batch_size, sq, num_heads, v_dim}, q_absorbed.options());     // [B,Sq,128,128]
-    // Softmax denominator, one scalar per (b,q,h) row: 3c accumulates it, 3d divides by
-    // it. Split-K adds partials with atomicAdd, so that path needs a zeroed start.
-    auto row_sum = ctx_atomic
-        ? torch::zeros({flat_total}, q_absorbed.options().dtype(acc_dtype))
-        : torch::empty({flat_total}, q_absorbed.options().dtype(acc_dtype));
-    // Row maxima, folded into 3a's epilogue rather than costing a pass of their own.
-    // Needed for correctness only when 3c splits Sk (partials must share a scale), but
-    // supplied always: knowing the maximum up front lets 3c skip its per-tile max scan,
-    // its accumulator rescale, and one of its four barriers. Measured 3c -2.7% against
-    // 3a +0.7%.
-    // 3a folds the row maxima in as it stores, so this starts at -inf rather than being
-    // written wholesale by a second pass over `scores`.
-    auto row_max = torch::full({flat_total},
-                               -std::numeric_limits<double>::infinity(),
-                               q_absorbed.options().dtype(acc_dtype));
+    // Softmax denominator, one scalar per (b,q,h) row: 3b computes it, 3d divides by it.
+    // 3b writes every entry exactly once, so neither path needs a zeroed start.
+    auto row_sum = torch::empty({flat_total}, q_absorbed.options().dtype(acc_dtype));
+
+    // Softmax partials, one per 3a Sk tile. 3a's grid.y splits a row across partials_per_row
+    // blocks, none of which can see the global maximum, so each emits its own (m_b, l_b)
+    // and 3b reconciles them. alpha = exp(m_b - M) is written by 3b and consumed by 3c.
+    const int partials_per_row = (sk + kScoreSkTile - 1) / kScoreSkTile;
+    const auto part_opts = q_absorbed.options().dtype(acc_dtype);
+    auto m_part = torch::empty({flat_total, partials_per_row}, part_opts);
+    auto l_part = torch::empty({flat_total, partials_per_row}, part_opts);
+    auto alpha  = torch::empty({flat_total, partials_per_row}, part_opts);
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -1548,10 +1547,31 @@ torch::Tensor launch_mla_attention(
                 q_absorbed.data_ptr<scalar_t>(), q_rope.data_ptr<scalar_t>(),
                 c_kv.data_ptr<scalar_t>(),       pe_cache.data_ptr<scalar_t>(),
                 scores.data_ptr<acc_t>(),
-                row_max.data_ptr<acc_t>(),
-                score_stride,
+                m_part.data_ptr<acc_t>(), l_part.data_ptr<acc_t>(),
+                partials_per_row, score_stride,
                 batch_size, sq, sk, num_heads, kv_rank, rope_dim,
                 static_cast<acc_t>(scale));
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        }));
+    }
+
+    // 3b: one warp per row, reducing that row's partials_per_row softmax partials into
+    //     the global maximum, the per-partial rescale alpha, and the denominator. The
+    //     kernel boundary after 3a is the grid-wide barrier that makes them all visible:
+    //     blocks within a launch cannot wait for each other, so this cannot fold into 3a.
+    //     Nor into 3c, whose kv_rank/kCtxRankTile rank tiles would each redo it.
+    {
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(q_absorbed.scalar_type(), "mla_combine", ([&] {
+            using acc_t = acc_t_of<scalar_t>;
+            // one warp per row -> kCombineThreads/32 rows per block, capped so the
+            // grid stays bounded when flat_total is very large (the kernel grid-strides)
+            const int rows_per_block = kCombineThreads / 32;
+            const int cb_blocks = std::min(
+                (flat_total + rows_per_block - 1) / rows_per_block, 65535);
+            mla_combine_kernel<acc_t><<<cb_blocks, kCombineThreads, 0, stream>>>(
+                m_part.data_ptr<acc_t>(), l_part.data_ptr<acc_t>(),
+                alpha.data_ptr<acc_t>(),  row_sum.data_ptr<acc_t>(),
+                flat_total, partials_per_row);
             C10_CUDA_KERNEL_LAUNCH_CHECK();
         }));
     }
@@ -1564,10 +1584,10 @@ torch::Tensor launch_mla_attention(
 
         dim3 threads(kTileThreadsX, kTileThreadsY);  // 16×16 = 256 threads
         dim3 blocks(ctx_flat_tiles, ctx_r_tiles, ctx_split);
-        // SMEM: p[128][32] + ck[128][32] acc_t rows padded to 33, plus the running
-        // (max, sum, rescale) triple, one entry per flat row of the tile
-        size_t smem = (static_cast<size_t>(kCtxFlatTile + kCtxRankTile) * kCtxSkPad
-                       + 3 * static_cast<size_t>(kCtxFlatTile)) * acc_size;
+        // SMEM: p[128][32] + ck[128][32] acc_t rows padded to 33. The running
+        // (max, sum, rescale) triple is gone — 3a and 3b own the softmax now.
+        size_t smem = static_cast<size_t>(kCtxFlatTile + kCtxRankTile)
+                      * kCtxSkPad * acc_size;
         AT_DISPATCH_FLOATING_TYPES_AND_HALF(q_absorbed.scalar_type(), "mla_ctx", ([&] {
             using acc_t = acc_t_of<scalar_t>;
             if (ctx_atomic) {
@@ -1576,7 +1596,7 @@ torch::Tensor launch_mla_attention(
                 kernel<<<blocks, threads, smem, stream>>>(
                     scores.data_ptr<acc_t>(), c_kv.data_ptr<scalar_t>(),
                     ctx.data_ptr<acc_t>(),
-                    row_max.data_ptr<acc_t>(), row_sum.data_ptr<acc_t>(),
+                    alpha.data_ptr<acc_t>(), partials_per_row,
                     score_stride,
                     batch_size, sq, sk, num_heads, kv_rank, ctx_sk_chunk, true);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -1586,7 +1606,7 @@ torch::Tensor launch_mla_attention(
                 kernel<<<blocks, threads, smem, stream>>>(
                     scores.data_ptr<acc_t>(), c_kv.data_ptr<scalar_t>(),
                     ctx.data_ptr<scalar_t>(),
-                    row_max.data_ptr<acc_t>(), row_sum.data_ptr<acc_t>(),
+                    alpha.data_ptr<acc_t>(), partials_per_row,
                     score_stride,
                     batch_size, sq, sk, num_heads, kv_rank, ctx_sk_chunk, false);
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
