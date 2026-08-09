@@ -71,138 +71,114 @@ class BenchmarkScenario:
 
 
 # fmt: off
+# Names describe the serving situation the shape comes from, not the vendor whose
+# benchmark table it was read out of; the `source` field carries that provenance.
+# Two further prefill points (B=1 Sq=Sk=8192 and B=16 Sq=Sk=2048) are deliberately
+# absent: both need a ~34 GB `scores` tensor and OOM on a 48 GB card.
 PRODUCTION_SCENARIOS: List[BenchmarkScenario] = [
-    # --- quick / CI ---
-    BenchmarkScenario(
-        name="smoke",
-        batch=2, sq=128, sk=128,
-        phase="mixed",
-        source="local CI",
-        description="Fast sanity check with full V3 ratios",
-        num_iters=20,
-        tags=["quick"],
-    ),
-
     # --- decode (memory-bandwidth bound; sq=1 or small sq) ---
     BenchmarkScenario(
-        name="decode_single_64k_cache",
+        name="decode_single_user_long_ctx",
         batch=1, sq=1, sk=65536,
         phase="decode",
         source="ThunderMLA / FlashMLA (B=1, Seq=64k, Q=1)",
-        description="Single stream, very long KV cache — classic FlashMLA decode point",
+        description="One stream at maximum context: latency for a single long-session user",
         num_iters=10,
-        tags=["decode", "flashmla"],
+        tags=["decode", "long-context"],
     ),
     BenchmarkScenario(
-        name="decode_production_avg_cache",
+        name="decode_serving_avg_ctx",
         batch=128, sq=1, sk=4989,
         phase="decode",
         source="DeepSeek inference overview (avg KV length/output token)",
-        description="High-concurrency decode at DeepSeek production average cache depth",
+        description="Steady-state serving: 128 concurrent users at DeepSeek's reported "
+                    "production-average context depth",
         num_iters=15,
-        tags=["decode", "production"],
+        tags=["decode", "serving"],
     ),
     BenchmarkScenario(
-        name="decode_nvidia_h100_throughput",
+        name="decode_serving_long_ctx",
         batch=128, sq=1, sk=8192,
         phase="decode",
         source="NVIDIA DGXC DeepSeek-R1 benchmark (decode batch=128, long context)",
-        description="H100-class max-throughput decode configuration",
+        description="Same concurrency as above but every session near an 8k context limit",
         num_iters=15,
-        tags=["decode", "nvidia"],
+        tags=["decode", "serving", "long-context"],
     ),
     BenchmarkScenario(
-        name="decode_nvidia_b200_throughput",
+        name="decode_serving_high_batch",
         batch=256, sq=1, sk=2048,
         phase="decode",
         source="NVIDIA DGXC DeepSeek-R1 benchmark (decode batch=256)",
-        description="Blackwell-class high-batch decode",
+        description="Throughput-first serving: batch traded up, context traded down",
         num_iters=15,
-        tags=["decode", "nvidia"],
+        tags=["decode", "serving"],
     ),
     BenchmarkScenario(
-        name="decode_mtp_2tok",
+        name="decode_speculative_2tok",
         batch=64, sq=2, sk=512,
         phase="decode",
         source="ThunderMLA (B=64, Seq=512, Q=2)",
-        description="Multi-token / speculative decode with moderate cache",
+        description="Speculative / multi-token decode verifying 2 draft tokens per step",
         num_iters=20,
-        tags=["decode", "mtp"],
+        # smallest real workload in the suite, so it doubles as the --quick CI check
+        tags=["decode", "speculative", "quick"],
     ),
     BenchmarkScenario(
-        name="decode_mtp_4tok",
+        name="decode_speculative_4tok",
         batch=64, sq=4, sk=768,
         phase="decode",
-        source="ThunderMLA (B=64, random Seq 256–1024, Q=4)",
-        description="Multi-query decode; sk set to mid-range of random-seq sweep",
+        source="ThunderMLA (B=64, random Seq 256-1024, Q=4)",
+        description="Speculative decode at 4 draft tokens; sk is the mid-range of the sweep",
         num_iters=20,
-        tags=["decode", "mtp"],
+        tags=["decode", "speculative"],
     ),
     BenchmarkScenario(
-        name="decode_high_concurrency",
+        name="decode_speculative_long_ctx",
         batch=132, sq=4, sk=4096,
         phase="decode",
         source="ThunderMLA (B=132, Seq=4k, Q=4)",
-        description="Large batch with 4k cache and 4 query tokens per sequence",
+        description="Speculative decode under both high concurrency and a 4k context",
         num_iters=10,
-        tags=["decode", "flashmla"],
+        tags=["decode", "speculative", "long-context"],
     ),
 
-    # --- prefill (compute bound; sq >> 1, typically sq == sk for new prompt) ---
+    # --- prefill (compute bound; sq >> 1, typically sq == sk for a new prompt) ---
     BenchmarkScenario(
-        name="prefill_short_prompt",
+        name="prefill_chat_batch",
         batch=8, sq=512, sk=512,
         phase="prefill",
         source="Typical chat / RAG prompt length",
-        description="Small batched prefill for interactive workloads",
+        description="Batched short prompts arriving together on an interactive endpoint",
         num_iters=20,
         tags=["prefill"],
     ),
     BenchmarkScenario(
-        name="prefill_single_2k",
+        name="prefill_chunk_2k",
         batch=1, sq=2048, sk=2048,
         phase="prefill",
         source="NVIDIA DGXC (H100 max_num_tokens=2048 chunked prefill chunk)",
-        description="Single-sequence chunked-prefill step on H100",
+        description="One chunk of a chunked-prefill schedule at a 2048-token budget",
         num_iters=10,
-        tags=["prefill", "nvidia"],
+        tags=["prefill", "chunked"],
     ),
     BenchmarkScenario(
-        name="prefill_single_4k",
+        name="prefill_chunk_4k",
         batch=1, sq=4096, sk=4096,
         phase="prefill",
         source="NVIDIA DGXC (GB200/B200 max_num_tokens=4096)",
-        description="Single-sequence chunked-prefill step on GB200/B200",
+        description="One chunk at a 4096-token budget — the largest prefill that fits here",
         num_iters=10,
-        tags=["prefill", "nvidia"],
-    ),
-    BenchmarkScenario(
-        name="prefill_nvidia_reference",
-        batch=1, sq=8192, sk=8192,
-        phase="prefill",
-        source="NVIDIA DGXC (ISL=8150 reference, requires chunked prefill at scale)",
-        description="Full reference input length; may OOM on smaller GPUs",
-        num_iters=5,
-        tags=["prefill", "nvidia", "large"],
-    ),
-    BenchmarkScenario(
-        name="prefill_batched_rag",
-        batch=16, sq=2048, sk=2048,
-        phase="prefill",
-        source="Batched document ingestion / RAG",
-        description="Moderate batch prefill for offline indexing pipelines",
-        num_iters=10,
-        tags=["prefill"],
+        tags=["prefill", "chunked"],
     ),
 ]
 # fmt: on
 
 
 QUICK_SCENARIOS = [s for s in PRODUCTION_SCENARIOS if "quick" in s.tags]
-DEFAULT_SCENARIOS = [s for s in PRODUCTION_SCENARIOS if "large" not in s.tags]
 
 # Subset for long-cache decode tuning (see --decode-focus)
-DECODE_FOCUS_NAMES = ("decode_single_64k_cache", "decode_production_avg_cache")
+DECODE_FOCUS_NAMES = ("decode_single_user_long_ctx", "decode_serving_avg_ctx")
 DECODE_FOCUS_SCENARIOS = [s for s in PRODUCTION_SCENARIOS if s.name in DECODE_FOCUS_NAMES]
 
 
@@ -586,24 +562,19 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--quick",
         action="store_true",
-        help="Run smoke test only (fast CI)",
+        help="Run the single smallest scenario only (fast CI check)",
     )
     parser.add_argument(
         "--decode-focus",
         action="store_true",
         help=(
-            "Run decode_single_64k_cache and decode_production_avg_cache only "
+            "Run decode_single_user_long_ctx and decode_serving_avg_ctx only "
             "(long-cache decode targets)"
         ),
     )
     parser.add_argument(
-        "--include-large",
-        action="store_true",
-        help="Include large prefill scenarios (e.g. sq=sk=8192) that may OOM",
-    )
-    parser.add_argument(
         "--phase",
-        choices=["all", "decode", "prefill", "mixed"],
+        choices=["all", "decode", "prefill"],
         default="all",
         help="Filter scenarios by workload phase",
     )
@@ -611,7 +582,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--scenario",
         type=str,
         default=None,
-        help="Run one scenario by name (e.g. decode_production_avg_cache)",
+        help="Run one scenario by name (e.g. decode_serving_avg_ctx)",
     )
     parser.add_argument(
         "--scenarios",
@@ -619,7 +590,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         metavar="NAME",
         help=(
             "Run only these scenarios (space- or comma-separated), e.g. "
-            "--scenarios decode_single_64k_cache decode_production_avg_cache"
+            "--scenarios decode_single_user_long_ctx decode_serving_avg_ctx"
         ),
     )
     return parser.parse_args(argv)
@@ -642,7 +613,7 @@ def select_scenarios(args: argparse.Namespace) -> List[BenchmarkScenario]:
     if args.quick:
         return QUICK_SCENARIOS
 
-    scenarios = PRODUCTION_SCENARIOS if args.include_large else DEFAULT_SCENARIOS
+    scenarios = list(PRODUCTION_SCENARIOS)
 
     if args.phase != "all":
         scenarios = [s for s in scenarios if s.phase == args.phase]

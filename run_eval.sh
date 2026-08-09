@@ -3,8 +3,8 @@
 # Usage examples (args are forwarded to exhaustive_benchmark_suite.py):
 #   bash run_eval.sh --quick
 #   bash run_eval.sh --decode-focus
-#   bash run_eval.sh --scenarios decode_single_64k_cache decode_production_avg_cache
-#   bash run_eval.sh --scenario decode_production_avg_cache
+#   bash run_eval.sh --scenarios decode_single_user_long_ctx decode_serving_avg_ctx
+#   bash run_eval.sh --scenario decode_serving_avg_ctx
 #
 # Skip rebuild: MLA_SKIP_BUILD=1 bash run_eval.sh --decode-focus
 

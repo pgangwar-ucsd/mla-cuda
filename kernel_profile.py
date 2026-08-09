@@ -52,7 +52,7 @@ def run(scenario, cfg):
 def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     cfg = DEEPSEEK_V3
-    want = {"decode_production_avg_cache", "decode_single_64k_cache", "prefill_short_prompt"}
+    want = {"decode_serving_avg_ctx", "decode_single_user_long_ctx", "prefill_chat_batch"}
     for scenario in PRODUCTION_SCENARIOS:
         if scenario.name in want:
             run(scenario, cfg)
