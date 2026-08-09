@@ -1,4 +1,4 @@
-# Multi-head Latent Attention — hand-written CUDA kernels
+# Multi-head Latent Attention — Hand-Written CUDA Kernels
 
 Hand-written CUDA implementation of DeepSeek-V3's **Multi-head Latent Attention
 (MLA)**, absorbed-inference path, benchmarked end to end against a
@@ -15,14 +15,12 @@ and the fused path runs at a **geometric-mean 0.77× of the PyTorch/cuBLAS
 baseline** — about 1.3× slower, tightly grouped between 0.71× and 0.83×.
 See [§3](#3-benchmarks).
 
-Contents: [why MLA](#1-why-mla) · [the algorithm, step by step](#2-the-algorithm-step-by-step) ·
-[benchmarks](#3-benchmarks) · [build & run](#4-build-and-run)
+## Contents
 
-> Every figure is also in **[docs/mla_figures.pdf](docs/mla_figures.pdf)**
-> (vector, print-ready). Regenerate with `python docs/make_figures.py`.
-> In the figures, **box widths are exactly proportional to the column count**;
-> heights follow the same scale until a box would run off the page, at which
-> point it is drawn truncated. Exact dimensions are printed under every box.
+1. [Why MLA](#1-why-mla)
+2. [The Algorithm, Step by Step](#2-the-algorithm-step-by-step)
+3. [Benchmarks](#3-benchmarks)
+4. [Build and Run](#4-build-and-run)
 
 ---
 
@@ -41,7 +39,7 @@ Two consequences shape every kernel here:
 
 ---
 
-# 2. The algorithm, step by step
+# 2. The Algorithm, Step by Step
 
 ![The 9 steps](docs/fig0_pipeline.png)
 
@@ -49,7 +47,7 @@ Shapes throughout are for **batch-128 decode**: `B=128, Sq=1, H=128`, so
 `bq = B·Sq = 128` rows and `flat = B·Sq·H = 16,384` rows, at DeepSeek's reported
 production-average cache depth `Sk = 4,989`.
 
-### The shared GEMM recipe
+### The Shared GEMM Recipe
 
 Five of the eight kernels (2a1, 2a2, 2c, 3a, 3c, 3d) are the same GEMM shape and
 use one recipe, so the per-step notes below only list what is *specific* to that
@@ -74,11 +72,11 @@ step:
 
 ---
 
-## Step 2a1 — project the hidden state into the latent
+## Step 2a1 — Project the Hidden State into the Latent
 
 ![Step 2a1](docs/step_2a1.png)
 
-**Techniques specific to this step**
+**Techniques Specific to This Step**
 
 - **Low-rank factorization (algorithmic).** This step exists only because the Q
   projection is factored through `q_lora_rank = 1536` rather than applied as one
@@ -88,11 +86,11 @@ step:
 - **Split-K over the 7,168 reduction.** The output is only 1536 columns = 12
   block tiles, so without it this step runs 12 blocks on an 84-SM GPU.
 
-## Step 2a-norm — RMSNorm on the latent
+## Step 2a-norm — RMSNorm on the Latent
 
 ![Step 2a-norm](docs/step_2an.png)
 
-**Techniques specific to this step**
+**Techniques Specific to This Step**
 
 - **Single-kernel block reduction.** One block per row, warp shuffles then one
   pass over the per-warp partials — no second launch and no global round-trip
@@ -103,11 +101,11 @@ step:
   `W_q_a @ W_q_b` collapses into a single rank-1536 matrix and the factorization
   can be undone.
 
-## Step 2a2 — expand the latent into the per-head query
+## Step 2a2 — Expand the Latent into the Per-Head Query
 
 ![Step 2a2](docs/step_2a2.png)
 
-**Techniques specific to this step**
+**Techniques Specific to This Step**
 
 - **Kernel reuse.** Same templated GEMM as 2a1; only the shapes and the split-K
   plan differ.
@@ -118,11 +116,11 @@ step:
 - **Blocking over `bq`, not one block per (row, head)**, which would re-read this
   weight once per row and turn 151 MB of traffic into 19.3 GB.
 
-## Step 2b — RoPE on the rope half
+## Step 2b — RoPE on the Rope Half
 
 ![Step 2b](docs/step_2b.png)
 
-**Techniques specific to this step**
+**Techniques Specific to This Step**
 
 - **Grid-stride loop capped at 32 × SM**, so the launch never scales with cache
   depth.
@@ -131,11 +129,11 @@ step:
   `arange(Sq)` would place the query at position 0, where the rotation is the
   identity.
 
-## Step 2c — absorb `W_uk` into the query
+## Step 2c — Absorb `W_uk` into the Query
 
 ![Step 2c](docs/step_2c.png)
 
-**Techniques specific to this step**
+**Techniques Specific to This Step**
 
 - **One head per block** (`grid.z = h`), so `W_uk[h]` (262 KB) is staged into
   shared memory once and amortized over the whole row tile instead of being
@@ -143,11 +141,11 @@ step:
 - **In-place slicing.** The nope half is read straight out of `q_raw` at stride
   192; no separate slice tensor is materialized.
 
-## Step 3a — scores, then the local softmax numerator
+## Step 3a — Scores, then the Local Softmax Numerator
 
 ![Step 3a](docs/step_3a.png)
 
-**Techniques specific to this step**
+**Techniques Specific to This Step**
 
 - **One merged 576-deep reduction.** `q_absorbed·c_kv` (512) and
   `q_rope·pe_cache` (64) run as a single loop that switches source operand at the
@@ -167,11 +165,11 @@ step:
   cache line makes every row start at a different offset; padding took store
   sectors per request from **5.75 → 4.00**.
 
-## Step 3b — reconcile the per-block softmax maxima
+## Step 3b — Reconcile the Per-Block Softmax Maxima
 
 ![Step 3b](docs/step_3b.png)
 
-**Techniques specific to this step**
+**Techniques Specific to This Step**
 
 - **The flash-softmax combine, done as a separate pass.** Exact because
   `exp(s − m_j) · exp(m_j − M) = exp(s − M)` holds termwise for *any* `m_j`.
@@ -182,11 +180,11 @@ step:
 - **`alpha` does double duty**: it is the weight in this kernel's denominator sum
   *and* exactly the factor step 3c needs, so one array serves both.
 
-## Step 3c — context
+## Step 3c — Context
 
 ![Step 3c](docs/step_3c.png)
 
-**Techniques specific to this step**
+**Techniques Specific to This Step**
 
 - **The correction rides the staging load.** Multiplying by `alpha_j` as the value
   lands means shared memory already holds `exp(s − M)` — the softmax numerator,
@@ -199,11 +197,11 @@ step:
   live per tile and the threads sharing a row hit the same address, so it stays
   L1-resident and costs no barrier.
 
-## Step 3d — reconstruct V and project out
+## Step 3d — Reconstruct V and Project Out
 
 ![Step 3d](docs/step_3d.png)
 
-**Techniques specific to this step**
+**Techniques Specific to This Step**
 
 - **One head per block**, same reuse argument as 2c.
 - **The deferred softmax divide.** Step 3c emitted the unnormalized numerator;
@@ -215,7 +213,7 @@ step:
 
 # 3. Benchmarks
 
-## What the baseline is
+## What the Baseline Is
 
 `baseline_official_mla_attention` in
 [exhaustive_benchmark_suite.py](exhaustive_benchmark_suite.py) — the **same
@@ -259,19 +257,7 @@ both sides measure the cold-cache behaviour a real decode step sees.
 **Average: 0.77× geometric mean** (0.77× arithmetic, 0.79× aggregate
 Σbase/Σfused), and the same 0.77× for decode and prefill taken separately.
 
-Reading it honestly:
-
-- **The spread is tight** — 0.71× to 0.83× across a 128× range of `Sk`, a 256×
-  range of batch, and both phases. The tiling generalizes; there is no single
-  pathological shape to go fix.
-- **cuBLAS is not a soft target.** With TF32 off it is still hand-tuned SASS with
-  software-pipelined double buffering, 128-bit vectorized loads, and per-shape
-  tile selection. The first two are exactly what this implementation is missing.
-- **Fusion savings are real but not where the time is.** Deleting the `attn`
-  round-trip removes 654 MB of traffic at `decode_serving_avg_ctx` (~0.85 ms at
-  peak bandwidth) — genuinely saved, then given back in 3a and 3c.
-
-## Where the time goes
+## Where the Time Goes
 
 `torch.profiler`, summed over the seven decode scenarios:
 
@@ -292,21 +278,9 @@ Reading it honestly:
 2a's share tracks `1/Sk` (4.1% at Sk=8192, 31.3% at Sk=512), which is why the
 factorization was worth doing first.
 
-## What is not done
-
-- **No `cp.async` double buffering.** Overlap of the next tile's global→shared
-  copy with the current tile's compute happens only implicitly, via the second
-  resident block. Largest remaining lever.
-- **No `float4` / vectorized shared-memory loads.** The strided thread mapping was
-  landed specifically to unblock this.
-- **No tensor cores.** Everything is FP32 FMA on the CUDA cores.
-- **No B=1 GEMV specialization** for the Q projection.
-- **No single-kernel fused stage 3** — `scores` is still materialized in HBM, so
-  two prefill shapes needing a ~34 GB tensor are excluded from the suite.
-
 ---
 
-# 4. Build and run
+# 4. Build and Run
 
 Requires an NVIDIA GPU of compute capability 8.0+ (prebuilt for `sm_80`, `sm_89`,
 `sm_90`), CUDA 12.x, and conda. Built and verified against **Python 3.9 +
@@ -335,7 +309,7 @@ MLA_SKIP_BUILD=1 bash run_eval.sh --decode-focus   # skip the rebuild
 `--decode-focus` is **not** "all decode" — it is a hardcoded 2-scenario tuning
 subset. Use `--phase decode` for all seven.
 
-## Repo layout
+## Repo Layout
 
 | File | Purpose |
 |---|---|
