@@ -835,8 +835,12 @@ mla_scores_kernel(
     // batch for c_kv / pe_cache rows (the flat tile stays inside one batch as long
     // as Sq*H is a multiple of it, which holds for H=128 and a 128-wide tile)
     const int batch_idx = min(flat_base, max(flat_total - 1, 0)) / (sq * num_heads);
-    const int ck_batch_stride = batch_idx * sk * kv_rank;
-    const int pe_batch_stride = batch_idx * sk * rope_dim;
+    // Block-invariant offsets folded in once, so the staging loops below index with a
+    // single row multiply instead of keeping a pointer and an offset alive apiece.
+    const scalar_t* qa_base = q_absorbed + flat_base * kv_rank;
+    const scalar_t* qr_base = q_rope     + flat_base * rope_dim;
+    const scalar_t* ck_base = c_kv       + batch_idx * sk * kv_rank;
+    const scalar_t* pe_base = pe_cache   + batch_idx * sk * rope_dim;
 
     const int coop_stride = kTileThreads;  // constexpr: lets the staging loops unroll
     const acc_t inv_scale = acc_t(1) / scale;
@@ -864,6 +868,13 @@ mla_scores_kernel(
     const int lf0 = threadIdx.y;
     const int lk0 = threadIdx.x;
 
+    // Staging geometry, all invariant over the reduction: see the loop body for why.
+    const int tid         = threadIdx.x + threadIdx.y * kTileThreadsX;
+    const int r_local     = tid & (kScoreRankTile - 1);
+    const int stage_start = tid / kScoreRankTile;
+    const int stage_step  = coop_stride / kScoreRankTile;   // 8 rows per pass
+    const int lf_end      = min(kScoreFlatTile, flat_total - flat_base);
+    const int lk_end      = min(kScoreSkTile,   sk - k0);
 
     // ---- One reduction over the full qk depth: kv_rank then rope_dim ----
     // scores = q_absorbed·c_kv + q_rope·pe_cache is a single (kv_rank + rope_dim)-deep
@@ -881,34 +892,29 @@ mla_scores_kernel(
         // Cooperative staging. The loop extent is the *full* tile width, not tile_len,
         // so the div/mod fold to a shift and a mask instead of an integer division by a
         // runtime value; a short trailing tile is handled by predicating the store. 
-        const int stage_elems_q = kScoreFlatTile * kScoreRankTile;
-        const int stage_elems_k = kScoreSkTile * kScoreRankTile;
+        // r_local is loop-invariant: idx starts at tid, steps by coop_stride = 256, and the
+        // modulus is kScoreRankTile = 32, so idx % 32 never changes across the 16 passes.
+        // That makes `r_local < tile_len` invariant as well, hoisted here instead of
+        // re-evaluated every pass; the row index then advances by a constant, so the
+        // flat/sk bound becomes a trip count rather than a per-element compare; and the
+        // whole source offset except the row multiply folds into a base pointer.
+        if (r_local < tile_len) {
+            // one row stride for both sides: q_rope/pe_cache are rope_dim-wide, the
+            // kv_rank tiles are kv_rank-wide, and the choice is uniform across the block
+            const int row = rope ? rope_dim : kv_rank;
 
-        // stage the q side → qa_smem[lf][r^lf]
-        // both sources are contiguous in r → r_local must be idx% so warps coalesce
-        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
-             idx < stage_elems_q; idx += coop_stride) {
-            const int lf_s    = idx / kScoreRankTile;
-            const int r_local = idx % kScoreRankTile;
-            const int flat_s  = flat_base + lf_s;
-            if (flat_s < flat_total && r_local < tile_len)
+            // stage the q side → qa_smem[lf][r]
+            const scalar_t* q_src = (rope ? qr_base : qa_base) + r_base + r_local;
+            for (int lf_s = stage_start; lf_s < lf_end; lf_s += stage_step)
                 qa_smem[lf_s * kScoreRankPad + r_local] =
-                    static_cast<acc_t>(
-                        rope ? q_rope[flat_s * rope_dim + r_base + r_local]
-                             : q_absorbed[flat_s * kv_rank + r_base + r_local]);
-        }
+                    static_cast<acc_t>(q_src[lf_s * row]);
 
-        // stage the k side → ck_smem[lk][r^lk] (contiguous in r either way)
-        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
-             idx < stage_elems_k; idx += coop_stride) {
-            const int lk_s    = idx / kScoreRankTile;
-            const int r_local = idx % kScoreRankTile;
-            const int k_s     = k0 + lk_s;
-            if (k_s < sk && r_local < tile_len)
+            // stage the k side → ck_smem[lk][r] (contiguous in r either way)
+            const scalar_t* k_src =
+                (rope ? pe_base : ck_base) + k0 * row + r_base + r_local;
+            for (int lk_s = stage_start; lk_s < lk_end; lk_s += stage_step)
                 ck_smem[lk_s * kScoreRankPad + r_local] =
-                    static_cast<acc_t>(
-                        rope ? pe_cache[pe_batch_stride + k_s * rope_dim + r_base + r_local]
-                             : c_kv[ck_batch_stride + k_s * kv_rank + r_base + r_local]);
+                    static_cast<acc_t>(k_src[lk_s * row]);
         }
         __syncthreads();  // loads done before any thread reads this tile
 
@@ -916,7 +922,11 @@ mla_scores_kernel(
         // Lanes past flat_total / sk read unwritten SMEM; their accumulators are dropped
         // at the store, so no per-iteration bounds predicate is needed here.
         // Capped at 8, matching 3c/3d: a full 64-wide unroll asks for more live values
-        // than the 64-register budget holds and spills ~1.2 KB per thread to local.
+        // than the 128-register budget holds and spills ~1.2 KB per thread to local.
+        // Unrolling the r_local loop itself is a separate question and was measured: 2, 4
+        // and 8 all compile without spilling (4 and 8 even drop this kernel to 110
+        // registers), but none of them moved the benchmark — the strip is limited by
+        // shared-memory bandwidth at 0.25 loads/FMA, so extra ILP has nothing to hide.
         if (tile_len == kScoreRankTile) {
             #pragma unroll 1
             for (int r_local = 0; r_local < kScoreRankTile; ++r_local) {
@@ -1180,6 +1190,7 @@ mla_ctx_kernel(
     const int ck_batch_stride = batch_idx * sk * kv_rank;
 
     const int coop_stride = kTileThreads;  // constexpr: lets the staging loops unroll
+    const scalar_t* ck_base = c_kv + ck_batch_stride;  // block-invariant, folded in once
 
     acc_t s[kTileReg][kTileReg];
     #pragma unroll
@@ -1194,6 +1205,19 @@ mla_ctx_kernel(
     const int lr0 = threadIdx.x;
 
     const int tid = threadIdx.x + threadIdx.y * kTileThreadsX;
+
+    // Staging geometry, invariant over the Sk loop. Both staging loops step idx by
+    // coop_stride = 256 against a power-of-two modulus, so the idx%% term never changes
+    // and the predicate that uses it hoists; the other index then advances by a constant,
+    // which turns its bound into a trip count.
+    const int k_local_s = tid & (kCtxSkTile - 1);          // p-side: invariant column
+    const int p_start   = tid / kCtxSkTile;
+    const int p_step    = coop_stride / kCtxSkTile;        // 8 rows per pass
+    const int lf_end    = min(kCtxFlatTile, flat_total - flat_base);
+    const int lr_s      = tid & (kCtxRankTile - 1);        // c_kv side: invariant rank
+    const int r_s       = r0 + lr_s;
+    const int ck_start  = tid / kCtxRankTile;
+    const int ck_step   = coop_stride / kCtxRankTile;      // 2 keys per pass
 
     for (int k0 = k_begin; k0 < k_end; k0 += kCtxSkTile) {
         const int tile_len =
@@ -1216,29 +1240,20 @@ mla_ctx_kernel(
         // rather than a runtime integer division; a short trailing tile is handled by
         // predicating the store.
         const int partial_idx = k0 / kScoreSkTile;
-        const int stage_elems = kCtxFlatTile * kCtxSkTile;
-        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
-             idx < stage_elems; idx += coop_stride) {
-            const int lf_s    = idx / kCtxSkTile;
-            const int k_local = idx % kCtxSkTile;
-            const int flat_s  = flat_base + lf_s;
-            if (flat_s < flat_total && k_local < tile_len)
-                p_smem[lf_s * kCtxSkPad + k_local] =
-                    scores[flat_s * score_stride + k0 + k_local]
-                    * alpha[flat_s * partials_per_row + partial_idx];
+        if (k_local_s < tile_len) {
+            const acc_t* p_src = scores + flat_base * score_stride + k0 + k_local_s;
+            const acc_t* a_src = alpha  + flat_base * partials_per_row + partial_idx;
+            for (int lf_s = p_start; lf_s < lf_end; lf_s += p_step)
+                p_smem[lf_s * kCtxSkPad + k_local_s] =
+                    p_src[lf_s * score_stride] * a_src[lf_s * partials_per_row];
         }
 
         // stage c_kv[b, k0:k0+tile, r0:r0+128) — r contiguous → lr = idx % kRs
-        const int ck_elems = tile_len * kCtxRankTile;
-        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
-             idx < ck_elems; idx += coop_stride) {
-            const int k_local = idx / kCtxRankTile;
-            const int lr_s    = idx % kCtxRankTile;
-            const int r_s     = r0 + lr_s;
-            if (k_local < tile_len && r_s < kv_rank)
+        if (r_s < kv_rank) {
+            const scalar_t* c_src = ck_base + k0 * kv_rank + r_s;
+            for (int k_local = ck_start; k_local < tile_len; k_local += ck_step)
                 ck_smem[lr_s * kCtxSkPad + k_local] =
-                    static_cast<acc_t>(
-                        c_kv[ck_batch_stride + (k0 + k_local) * kv_rank + r_s]);
+                    static_cast<acc_t>(c_src[k_local * kv_rank]);
         }
         __syncthreads();
 
@@ -1249,7 +1264,8 @@ mla_ctx_kernel(
 
         // k-outer register strip: 8 p + 8 ck SMEM loads feed 64 FMAs (0.25 loads/FMA).
         // Lanes past flat_total / kv_rank read unwritten SMEM; dropped at the store.
-        // Not unrolled: 64 FMAs per step is already ample ILP and a wider unroll spills.
+        // Not unrolled: 64 FMAs per step is already ample ILP. A wider unroll does not
+        // spill here (measured at 2, 4 and 8) but does not help either; see 3a.
         if (tile_len == kCtxSkTile) {
             #pragma unroll 1
             for (int k_local = 0; k_local < kCtxSkTile; ++k_local) {
@@ -1376,7 +1392,9 @@ mla_output_smem_kernel(
         // stage ctx[bq_base:+kBqTile, h, r0:+tile) — r contiguous so warps coalesce.
         // Full-tile extent, not tile_len, so the div/mod fold to a shift and a mask
         // rather than a runtime integer division; a short trailing tile is handled by
-        // predicating the store. Measured 26% off mla_scores_kernel.
+        // predicating the store. Measured 26% off mla_scores_kernel back when that kernel
+        // staged this way; 3a and 3c have since hoisted the div/mod out of the loop
+        // entirely (see mla_scores_kernel), which this kernel has not yet been given.
         const int ctx_elems = kBqTile * kOutRankTile;
         for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
              idx < ctx_elems; idx += coop_stride) {

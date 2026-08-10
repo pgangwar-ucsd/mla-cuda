@@ -1,24 +1,22 @@
 # Multi-head Latent Attention — Hand-Written CUDA Kernels
 
 Hand-written CUDA implementation of DeepSeek-V3's **Multi-head Latent Attention
-(MLA)**, absorbed-inference path, benchmarked end to end against a
+(MLA)**, benchmarked end to end against a
 PyTorch/cuBLAS reference on an RTX A6000.
 
 ```
 hidden = 7168     H (heads)  = 128     kv_lora_rank  = 512     q_lora_rank = 1536
 nope   = 128      rope       = 64      qk_head_dim   = 192     v_head_dim  = 128
-                                       Q_absorbed    = 512 + 64 = 576
+Q_absorbed  = 512 + 64 = 576
 ```
 
-**Result up front:** correctness passes on all 10 production-shaped scenarios,
-and the fused path runs at a **geometric-mean 0.77× of the PyTorch/cuBLAS
-baseline** — about 1.3× slower, tightly grouped between 0.71× and 0.83×.
-See [§3](#3-benchmarks).
+**Results:** CUDA kernel runs at a **geometric-mean 0.82× of the PyTorch/cuBLAS
+baseline**. See [Benchmarks](#3-benchmarks).
 
 ## Contents
 
 1. [Why MLA](#1-why-mla)
-2. [The Algorithm, Step by Step](#2-the-algorithm-step-by-step)
+2. [Algorithm](#2-algorithm)
 3. [Benchmarks](#3-benchmarks)
 4. [Build and Run](#4-build-and-run)
 
@@ -30,16 +28,28 @@ See [§3](#3-benchmarks).
 
 Two consequences shape every kernel here:
 
-- **The cache carries no head index.** All 128 heads of a query read the *same*
-  cache rows, so a block that owns all 128 heads at once stages the cache once
-  and reuses it 128 times.
-- **Decode is memory-bound.** With `Sq = 1` there is no arithmetic intensity to
-  find in attention itself; the wins come from not moving bytes and from keeping
-  all 84 SMs busy.
+- **The KV cache is reused across all heads.** The cache is the pair
+  `c_kv [B, Sk, 512]` and `pe_cache [B, Sk, 64]`; a *cache row* is one key's
+  `c_kv[b, k, :]` (512 latent *ranks*) plus `pe_cache[b, k, :]` (64 rope dims).
+  A **rank** is one index along `kv_lora_rank = 512`: the cache never stores K or
+  V. Neither tensor has an `H` axis, so all 128 heads of a query score against the
+  identical `k` rows — unlike standard MHA. Step 3a exploits this directly: its 
+  128-row thread block tile is exactly `H`, so a block's rows are the 128 heads 
+  of one query, and each `[128 keys × 32 dims]` slab it stages into shared memory 
+  — one step of the 576-deep reduction, taken from `c_kv`'s 512 ranks and then 
+  `pe_cache`'s 64 rope dims — is read by all 128 of them.
+- **The projection weights are reused across a batch.** `W_uk [H, 128 nope, 512]` and
+  `W_uv [H, 128 v_dim, 512]` carry a head axis, which is the same panel for every 
+  query in a batch. The reuse is therefore over **`bq` rows**: the `B·Sq` 
+  (batch, query-position) pairs. Step 2c gives one head to each thread block
+  (`grid.z = h`); a block stages only its own head's slice of `W_uk`, but stages it 
+  once for its whole tile of `bq` rows (16–128 rows). So, a block per `(bq, h)` would 
+  re-read head `h`'s panel once per row instead. 3d does the same with `W_uv[h]`.
+- **Decode is memory-bound.** With `Sq = 1` there is no arithmetic intensity in the attention calculation; the wins come from not moving bytes and from keeping all 84 SMs busy.
 
 ---
 
-# 2. The Algorithm, Step by Step
+# 2. Algorithm
 
 ![The 9 steps](docs/fig0_pipeline.png)
 
@@ -47,28 +57,54 @@ Shapes throughout are for **batch-128 decode**: `B=128, Sq=1, H=128`, so
 `bq = B·Sq = 128` rows and `flat = B·Sq·H = 16,384` rows, at DeepSeek's reported
 production-average cache depth `Sk = 4,989`.
 
-### The Shared GEMM Recipe
+### The GEMM Recipe
 
-Five of the eight kernels (2a1, 2a2, 2c, 3a, 3c, 3d) are the same GEMM shape and
+Five kernels across six of the nine steps (2a1, 2a2, 2c, 3a, 3c, 3d) are the same GEMM shape and
 use one recipe, so the per-step notes below only list what is *specific* to that
 step:
 
-- **128×128 output tile per block**, `16×16 = 256` threads, **8×8 outputs per
-  thread**. An M×N register tile costs M+N shared-memory loads per M·N FMAs, so
-  8×8 gives 0.25 loads/FMA — sm_86 issues 128 FP32 lanes against 32 shared-memory
-  words per clock, i.e. it wants exactly 4 FMAs per loaded word.
-- **Reduction contracted in shared-memory tiles of 32**, staged cooperatively by
-  all 256 threads.
-- **Coalescing:** `threadIdx.x` indexes the contiguous output dimension, so a
-  warp writes runs of adjacent addresses — 4.00 store sectors per request (the
-  ideal) against 23.99 if the row index came from `threadIdx.x`.
-- **Bank-conflict-free shared memory** by `+1` row padding rather than an XOR
-  swizzle, which keeps the address linear in the reduction index.
-- **Occupancy traded for ILP:** 8×8 costs ~128 registers → 2 blocks/SM. The
-  inner loop is deliberately *not* unrolled; any spill loses more than the
-  occupancy is worth.
-- **Adaptive `bq` tile** (16/32/64/128 rows) so a single-stream decode does not
-  spend 127/128 of its FMAs on rows the epilogue discards.
+- **128×128 output tile per thread block** - `16×16 = 256` threads per block, **8×8 
+  outputs per thread**. An M×N register tile costs M+N shared-memory loads per M·N FMAs, 
+  so 8×8 gives 0.25 loads/FMA — sm_86 issues 128 FP32 lanes per SM against 32 shared-memory
+  words (4 Bytes) per clock, i.e. it wants exactly 4 FMAs per loaded word.
+- **The contracted dimension is walked 32 at a time** - A block's 128×128 output
+  tile is a dot product over 32-deep chunks: all 256 threads cooperatively stage a 
+  `[128 × 32]` slab of each operand into shared memory, barrier, reduce that slab into 
+  the register tiles, barrier, repeat. 32 is the largest chunk that keeps **2 blocks resident per SM**
+  — `(128 + 128) × 33 × 4 B = 33.8 KB` per block, so 67.6 KB of the SM's 100 KB,
+  and 32 floats is exactly a 128 B cache line, so each staged row is one aligned transaction.
+- **Split-K when the output alone cannot fill the GPU** - A 128×128 output tile
+  means a small output yields few blocks: 2a1's 1536 columns are 12 tiles, and the
+  `bq` dimension collapses to a single tile for any `bq_total ≤ 128` — most of
+  decode — so the launch would occupy 12 of 84 SMs. Split-K adds a grid dimension
+  over the *reduction* instead: each slice takes a disjoint span of it, accumulates
+  its own partial, and `atomicAdd`s into a pre-zeroed output.
+- **Bounds check during results write-out** - A block always computes its whole 
+  128×128 tile, even when the real matrix has fewer rows or columns than that. 
+  The threads holding the leftover slots read whatever happens to be in shared 
+  memory, do their multiply-adds anyway, and the write-out step at the end simply 
+  skips them. The price is that a tile bigger than the data does real work for 
+  nothing, which is what the adaptive `bq` tile below avoids.
+- **Adaptive `bq` tile** - Kernels with row axis `bq` pick their tile height at
+  launch. The thread block is always 16×16 threads and `threadIdx.y` walks rows, so 
+  if each of those 16 columns owns `kBqReg` rows the tile is `16 × kBqReg` = 16, 32, 
+  64 or 128 rows, and a thread's accumulator block is `kBqReg × 8`. A single-stream decode has exactly one real row, so a 128-row tile would do 128 rows of work to keep 1. `bq_reg_for()` therefore picks the **smallest tile that still covers `bq_total`**: 16 at `bq = 1` (the floor, since `blockDim.y = 16`), 32 at `bq = 20`, etc., freeing up registers to increase occupancy.
+- **Coalescing** - All operand traffic is contiguous and line-aligned. Three
+  things enable this: `threadIdx.x` indexes the contiguous axis on the staging loads 
+  as well as the stores; each thread's 8 outputs are strided by `blockDim.x`, so one store instruction has the warp's lanes writing *adjacent* floats; and row strides are kept a 
+  multiple of 32 floats, so every row starts on a 128 B line (padded for `scores`,
+  whose width is `Sk` and not always line-aligned). 
+- **Occupancy traded for ILP** - The 8×8 tile requiress 64 accumulator registers, with 
+  operands, addressing, bounds and loop state accounting consuming to **107 to 128**
+  registers per thread. `__launch_bounds__(256, 2)` caps a thread at
+  `65,536 / 512 = 128 registers`, so all kernels fit without spilling.
+- **Bank-conflict-free shared memory** - Row padding by `+1` rather than an XOR
+  swizzle. Padding keeps the address *linear* in the reduction
+  index, so addressing is a base pointer plus immediate offsets instead of an XOR
+  and an add per operand per step. This reduces the ALU pressure,
+  and it frees registers — a swizzle keeps its mask and permuted index live across
+  the *entire* reduction, every such value is one the scheduler cannot spend on 
+  prefetching the next operand.
 
 ---
 
@@ -164,6 +200,19 @@ step:
 - **Output row-stride padded to 128 B lines.** A row stride that is not a whole
   cache line makes every row start at a different offset; padding took store
   sectors per request from **5.75 → 4.00**.
+- **Staging loops strength-reduced to one multiply per element** (3c does the
+  same). Walking the staging index as `idx += 256` and splitting it with
+  `idx / 32` and `idx % 32` costs a shift, a mask, two bounds compares, a
+  two-way source select and a runtime-stride `IMAD` on *every* staged element.
+  But 256 is a multiple of 32, so `idx % 32` never changes — the column index and
+  its `< tile_len` predicate are loop-invariant and hoist out entirely, the row
+  index then advances by a constant so its bound becomes a trip count rather than
+  a compare, and every block-invariant offset (`flat_base`, the batch stride,
+  `k0`, `r_base`) folds into a base pointer once. What is left in the loop is one
+  row multiply, one load and one store. This is what took 3a from 127 to 107
+  registers and the suite from 0.77× to 0.82× — not the register count, which
+  unrolling also cut with no effect, but the instructions no longer competing for
+  issue slots with the shared-memory traffic.
 
 ## Step 3b — Reconcile the Per-Block Softmax Maxima
 
@@ -243,19 +292,27 @@ both sides measure the cold-cache behaviour a real decode step sees.
 
 | Scenario | Phase | B | Sq | Sk | Base ms | Fused ms | Speedup |
 |---|---|--:|--:|--:|--:|--:|--:|
-| `decode_single_user_long_ctx` | decode | 1 | 1 | 65536 | 1.92 | 2.57 | 0.75× |
-| `decode_serving_avg_ctx` | decode | 128 | 1 | 4989 | 14.14 | 18.11 | 0.78× |
-| `decode_serving_long_ctx` | decode | 128 | 1 | 8192 | 23.43 | 28.40 | 0.83× |
-| `decode_serving_high_batch` | decode | 256 | 1 | 2048 | 12.79 | 16.11 | 0.79× |
-| `decode_speculative_2tok` | decode | 64 | 2 | 512 | 2.59 | 3.65 | 0.71× |
-| `decode_speculative_4tok` | decode | 64 | 4 | 768 | 6.10 | 8.07 | 0.76× |
-| `decode_speculative_long_ctx` | decode | 132 | 4 | 4096 | 46.83 | 58.41 | 0.80× |
-| `prefill_chat_batch` | prefill | 8 | 512 | 512 | 69.95 | 93.56 | 0.75× |
-| `prefill_chunk_2k` | prefill | 1 | 2048 | 2048 | 92.57 | 119.79 | 0.77× |
-| `prefill_chunk_4k` | prefill | 1 | 4096 | 4096 | 351.10 | 437.59 | 0.80× |
+| `decode_single_user_long_ctx` | decode | 1 | 1 | 65536 | 1.93 | 2.46 | 0.78× |
+| `decode_serving_avg_ctx` | decode | 128 | 1 | 4989 | 14.27 | 17.09 | 0.83× |
+| `decode_serving_long_ctx` | decode | 128 | 1 | 8192 | 23.64 | 26.68 | 0.89× |
+| `decode_serving_high_batch` | decode | 256 | 1 | 2048 | 12.94 | 15.30 | 0.85× |
+| `decode_speculative_2tok` | decode | 64 | 2 | 512 | 2.61 | 3.49 | 0.75× |
+| `decode_speculative_4tok` | decode | 64 | 4 | 768 | 6.16 | 7.70 | 0.80× |
+| `decode_speculative_long_ctx` | decode | 132 | 4 | 4096 | 47.22 | 55.36 | 0.85× |
+| `prefill_chat_batch` | prefill | 8 | 512 | 512 | 70.58 | 90.30 | 0.78× |
+| `prefill_chunk_2k` | prefill | 1 | 2048 | 2048 | 94.19 | 114.70 | 0.82× |
+| `prefill_chunk_4k` | prefill | 1 | 4096 | 4096 | 355.87 | 420.43 | 0.85× |
 
-**Average: 0.77× geometric mean** (0.77× arithmetic, 0.79× aggregate
-Σbase/Σfused), and the same 0.77× for decode and prefill taken separately.
+**Average: 0.82× geometric mean** (0.82× arithmetic, 0.84× aggregate
+Σbase/Σfused); 0.82× for the seven decode shapes and for the three prefill shapes
+alike.
+
+Absolute milliseconds on this box drift by up to ~15% with GPU thermal state,
+and both columns drift together — so the ratios are the stable quantity and the
+table is reported from a single warm run rather than a best-of. The **first**
+scenario of a cold run is not usable: the cuBLAS side is still on a ramping clock
+and reads ~50% high, which is why the suite is run twice and the second run
+taken.
 
 ## Where the Time Goes
 
@@ -263,20 +320,26 @@ both sides measure the cold-cache behaviour a real decode step sees.
 
 | step | sum ms | share |
 |---|--:|--:|
-| **3a** scores | 60.68 | **44.8%** |
-| **3c** ctx | 53.97 | **39.8%** |
-| **2a1 + 2a2** Q projection | 13.28 | 9.8% |
-| 3d output | 2.75 | 2.0% |
-| 2c absorb | 2.46 | 1.8% |
-| ATen `.contiguous()` copies | 1.40 | 1.0% |
-| 3b combine | 0.67 | 0.5% |
-| 2b RoPE + 2a-norm | 0.19 | 0.1% |
-| **TOTAL** | **135.54** | 100% |
+| **3a** scores | 54.84 | **43.9%** |
+| **3c** ctx | 49.76 | **39.9%** |
+| **2a1 + 2a2** Q projection | 13.20 | 10.6% |
+| 3d output | 2.74 | 2.2% |
+| 2c absorb | 2.44 | 2.0% |
+| ATen `.contiguous()` copies and fills | 1.57 | 1.3% |
+| 2b RoPE + 2a-norm | 0.19 | 0.2% |
+| 3b combine | 0.11 | 0.1% |
+| **TOTAL** | **124.85** | 100% |
 
-**3a + 3c are 85% of decode**, and they are the two steps that never got
-`cp.async` or vectorized shared-memory loads — that is where the 0.77× lives.
-2a's share tracks `1/Sk` (4.1% at Sk=8192, 31.3% at Sk=512), which is why the
-factorization was worth doing first.
+**3a + 3c are 84% of decode.** Both are limited by shared-memory bandwidth, not
+by occupancy or instruction scheduling: at 0.25 loads/FMA the 8×8 register tile
+asks for 32 shared-memory words per clock against the 32 that sm_86 can deliver,
+so the reduction strip has no headroom to schedule into. Measured against that
+model — unrolling the strip by 2, 4 or 8 compiles without spilling and drops 3a
+from 127 to 110 registers, yet moves the benchmark by less than 1%, because
+extra ILP has nothing to hide behind. What *did* move it was removing issued
+work from the staging loops (see Step 3a): measured as a matched before/after
+pair on one GPU in one session, that is 0.77× → 0.82× geometric mean, −5.7%
+fused time averaged over the ten scenarios and faster on every one of them.
 
 ---
 

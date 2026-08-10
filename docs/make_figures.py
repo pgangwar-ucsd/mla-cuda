@@ -168,45 +168,81 @@ def gemm_step(fname, width_in, tag, formula, note, A, B, C, footer, avail_w=88.0
 # =============================================================================
 # OVERVIEW 1 — what MLA is
 # =============================================================================
+def eq_row(fig, ax, ymid, parts, fontsize, color):
+    """Lay mathtext `parts` out left-to-right as separate Text objects, then shift the
+    whole run to be horizontally centred. Returns one (left, right) x-span per part, in
+    data coords, so callouts can be anchored under the term they actually describe
+    instead of at a hand-tuned x that drifts whenever the formula is edited."""
+    fig.canvas.draw()
+    rend = fig.canvas.get_renderer()
+    inv = ax.transData.inverted()
+    texts, spans, x = [], [], 0.0
+    for s in parts:
+        t = ax.text(x, ymid, s, fontsize=fontsize, va="center", ha="left", color=color)
+        bb = t.get_window_extent(renderer=rend)
+        (xl, _), (xr, _) = inv.transform([[bb.x0, bb.y0], [bb.x1, bb.y1]])
+        texts.append(t)
+        spans.append([xl, xr])
+        x = xr
+    shift = (100.0 - (spans[-1][1] - spans[0][0])) / 2.0 - spans[0][0]
+    for t, sp in zip(texts, spans):
+        t.set_x(t.get_position()[0] + shift)
+        sp[0] += shift
+        sp[1] += shift
+    return spans
+
+
 def fig_idea():
-    fig, ax = canvas(11, 5.4)
-    H = 100 * 5.4 / 11
+    fig, ax = canvas(11, 7.5)
+    H = 100 * 7.5 / 11
     ax.text(3, H - 3.6, "Why MLA: one shared latent instead of 128 K/V pairs",
             fontsize=14, fontweight="bold", va="top", color=INK)
 
     ax.text(3, H - 11.0, "KV cache per token", fontsize=10.2, fontweight="bold",
             va="top", color=INK)
+    ax.text(3, H - 14.5,
+            "Both bars count the values cached for ONE key position — a single index of Sk, "
+            "shared by all 128 heads and by every one of the Sq queries.",
+            fontsize=8.4, va="top", color=INK2)
     span = 62.0
-    ax.text(6, H - 15.5, "standard MHA   —   128 heads x (192 K + 128 V)  =  40,960 values",
-            fontsize=8.6, va="bottom", color=INK)
-    rbox(ax, 6, H - 19.4, span, 3.4, W_C, radius=0.3)
+    ax.text(6, H - 21.0, "standard MHA   —   128 heads x (192 K + 128 V)  =  40,960 values "
+                         "per Sk position", fontsize=8.6, va="bottom", color=INK)
+    rbox(ax, 6, H - 24.9, span, 3.4, W_C, radius=0.3)
     mla_w = span * 576 / 40960
-    rbox(ax, 6, H - 25.4, mla_w, 3.4, KV_C, alpha=0.9, lw=2.0, radius=0.12)
-    ax.add_patch(FancyArrowPatch((6 + mla_w + 0.5, H - 23.7), (13.0, H - 23.7),
+    rbox(ax, 6, H - 31.0, mla_w, 3.4, KV_C, alpha=0.9, lw=2.0, radius=0.12)
+    ax.add_patch(FancyArrowPatch((6 + mla_w + 0.5, H - 29.3), (13.0, H - 29.3),
                                  arrowstyle="-|>", mutation_scale=7, lw=1.2,
                                  color=KV_C, shrinkA=0, shrinkB=0))
-    ax.text(13.8, H - 23.7,
-            "MLA   —   c_kv 512  +  pe 64  =  576 values       "
-            "(sliver drawn to the SAME scale: 1/71 of the bar above)",
+    ax.text(13.8, H - 29.3,
+            r"MLA   —   $c_{kv}$ (512)  +  $pe$ (64)  =  576 values per Sk position",
             fontsize=8.6, va="center", color=INK)
 
-    ax.text(3, H - 31.0, "The absorbed path: move the per-head matrix onto the query side",
+    ax.text(3, H - 37.0, "The absorbed path: move the per-head matrix onto the query side",
             fontsize=10.2, fontweight="bold", va="top", color=INK)
-    ax.text(8, H - 38.5,
-            r"$q_{nope}[h]\cdot K[h]\;=\;q_{nope}[h]\cdot"
-            r"\left(c_{kv}W_{uk}[h]^{\!\top}\right)\;=\;"
-            r"\left(q_{nope}[h]\,W_{uk}[h]\right)\cdot c_{kv}$",
-            fontsize=13, va="center", color=INK)
-    ax.plot([34.0, 34.0], [H - 40.9, H - 42.2], color=W_C, lw=1.4)
-    ax.text(34.0, H - 42.8, "reconstruct K for 128 heads\nSk x 128 x 192 values",
-            ha="center", va="top", fontsize=7.8, color=W_C)
-    ax.plot([64.0, 64.0], [H - 40.9, H - 42.2], color=Q_C, lw=1.4)
-    ax.text(64.0, H - 42.8, "absorb into the query, ONCE\n1 x 128 x 512 values",
-            ha="center", va="top", fontsize=7.8, color=Q_C)
+    ax.text(50, H - 41.3,
+            r"$q_{nope}[h]$ : Sq x 128          $c_{kv}$ : Sk x 512          "
+            r"$W_{uk}[h]$ : 128 x 512          so   $K_{nope}[h]=c_{kv}W_{uk}[h]^{\!\top}$ : Sk x 128",
+            ha="center", va="top", fontsize=8.4, color=INK2)
+    spans = eq_row(fig, ax, H - 49.0, [
+        r"$q_{nope}[h]\cdot K_{nope}[h]\;=\;$",
+        r"$q_{nope}[h]\cdot\left(c_{kv}W_{uk}[h]^{\!\top}\right)$",
+        r"$\;=\;$",
+        r"$\left(q_{nope}[h]\,W_{uk}[h]\right)\cdot c_{kv}$",
+    ], fontsize=13, color=INK)
+
+    for (xl, xr), color, label in (
+        (spans[1], W_C, "reconstruct K for all 128 heads\n"
+                        "Sk x 128 x 128 values\ngrows with the cache"),
+        (spans[3], Q_C, "absorb into the query, ONCE\n"
+                        "Sq x 128 x 512 values\nSq = 1 in decode"),
+    ):
+        xc = (xl + xr) / 2.0
+        ax.plot([xc, xc], [H - 53.0, H - 54.3], color=color, lw=1.4)
+        ax.text(xc, H - 54.9, label, ha="center", va="top", fontsize=7.8, color=color)
 
     ax.text(3, 1.5,
-            "c_kv and pe_cache carry no head index: all 128 heads of a query read the SAME cache rows.  "
-            "That is why kernel 3a gives one block\nall 128 heads at once — it stages the cache once and reuses it 128 times.",
+            "c_kv and pe_cache carry no head index: all 128 heads of a query read the SAME cache rows, "
+            "so kernel 3a gives one block all 128 heads at once.",
             fontsize=8.4, va="bottom", color=INK2)
     fig.savefig(os.path.join(OUT, "fig0_why_mla.png"), dpi=190, facecolor=SURFACE,
                 bbox_inches="tight", pad_inches=0.14)
@@ -217,34 +253,70 @@ def fig_idea():
 # OVERVIEW 2 — the 9 steps at a glance
 # =============================================================================
 def fig_pipeline():
-    fig, ax = canvas(12, 3.6)
-    H = 100 * 3.6 / 12
-    ax.text(3, H - 3.4, "The 9 steps", fontsize=14, fontweight="bold", va="top",
+    fig, ax = canvas(15.0, 5.3)
+    H = 100 * 5.3 / 15.0
+    ax.text(3, H - 2.6, "The 9 steps", fontsize=14, fontweight="bold", va="top",
             color=INK)
-    ax.text(3, H - 8.4, "Kernel 2 builds the 576-wide query; kernel 3 does the attention. "
-            "Shapes for batch-128 decode.", fontsize=9, va="top", color=INK2)
+    ax.text(3, H - 6.8,
+            "Kernel 2 builds the 576-wide query; kernel 3 does the attention.   "
+            "Shapes for batch-128 decode:  bq = B.Sq = 128 rows,  "
+            "flat = B.Sq.H = 16,384 rows,  Sk = 4,989.   "
+            "Every operand is listed by name; outputs are marked ->.",
+            fontsize=8.6, va="top", color=INK2)
 
-    steps = [("2a1", "x @ W_q_a", Q_C), ("2a-n", "RMSNorm", NEUT),
-             ("2a2", "@ W_q_b", Q_C), ("2b", "RoPE", NEUT),
-             ("2c", "@ W_uk[h]", Q_C), ("3a", "scores", KV_C),
-             ("3b", "combine", NEUT), ("3c", "ctx", KV_C), ("3d", "@ W_uv[h]", Q_C)]
-    w, gap = 8.6, 1.9
-    x0 = 3
-    for i, (n, o, c) in enumerate(steps):
+    # tag, the operation on the matrices, operands in, operands out, colour.
+    # Every matrix in a product is listed separately, with its own dimensions.
+    steps = [
+        ("2a1",  "x @ W_q_a",
+         ["x  128x7168", "W_q_a  7168x1536"], ["q_lat  128x1536"], Q_C),
+        ("2a-n", "RMSNorm(q_lat)",
+         ["q_lat  128x1536"], ["q_lat  128x1536"], NEUT),
+        ("2a2",  "q_lat @ W_q_b",
+         ["q_lat  128x1536", "W_q_b  1536x24576"], ["q_raw  128x24576"], Q_C),
+        ("2b",   "RoPE on q[128:192]",
+         ["q_raw  128x128x192"], ["q_rope  128x128x64"], NEUT),
+        ("2c",   "q_nope @ W_uk[h]",
+         ["q_nope  128x128x128", "W_uk[h]  128x512"],
+         ["q_absorbed  128x128x512"], Q_C),
+        ("3a",   "q @ cache^T, then exp",
+         ["q  16384x576", "cache^T  576x4989"],
+         ["scores  16384x4989", "m,l  16384x39"], KV_C),
+        ("3b",   "max, then exp(m-M)",
+         ["m,l  16384x39"], ["alpha  16384x39", "row_sum  16384"], NEUT),
+        ("3c",   "p @ c_kv",
+         ["p  16384x4989", "c_kv  4989x512"], ["ctx  16384x512"], KV_C),
+        ("3d",   "ctx @ W_uv[h]^T",
+         ["ctx  16384x512", "W_uv[h]^T  512x128"], ["out  16384x128"], Q_C),
+    ]
+    w, gap = 9.3, 1.2
+    x0 = 3.0
+    ybox, hbox = 11.0, 7.6
+    for i, (n, o, d_in, d_out, c) in enumerate(steps):
         x = x0 + i * (w + gap)
-        rbox(ax, x, 4.0, w, 8.4, c, radius=0.6)
-        ax.text(x + w / 2, 9.7, n, ha="center", fontsize=9.6, fontweight="bold",
+        xc = x + w / 2.0
+        rbox(ax, x, ybox, w, hbox, c, radius=0.6)
+        ax.text(xc, ybox + 4.6, n, ha="center", fontsize=9.6, fontweight="bold",
                 color=INK)
-        ax.text(x + w / 2, 6.3, o, ha="center", fontsize=7.5, color=INK2)
+        ax.text(xc, ybox + 1.7, o, ha="center", fontsize=6.4, color=INK2)
+        y = ybox - 1.9
+        for lbl in d_in:
+            ax.text(xc, y, lbl, ha="center", fontsize=6.0, color=MUTED)
+            y -= 2.3
+        for lbl in d_out:
+            ax.text(xc, y, "-> " + lbl, ha="center", fontsize=6.0, color=c)
+            y -= 2.3
         if i:
-            ax.add_patch(FancyArrowPatch((x - gap + 0.2, 8.2), (x - 0.2, 8.2),
+            ax.add_patch(FancyArrowPatch((x - gap + 0.2, ybox + hbox / 2.0),
+                                         (x - 0.2, ybox + hbox / 2.0),
                                          arrowstyle="-|>", mutation_scale=7,
                                          lw=1.3, color=MUTED, shrinkA=0, shrinkB=0))
-    ax.plot([3, 3 + 5 * (w + gap) - gap], [15.4, 15.4], color=Q_C, lw=2.0)
-    ax.text(3, 16.4, "KERNEL 2  —  Q path", fontsize=8.8, fontweight="bold",
+    yr = ybox + hbox + 3.0
+    ax.plot([x0, x0 + 5 * (w + gap) - gap], [yr, yr], color=Q_C, lw=2.0)
+    ax.text(x0, yr + 1.0, "KERNEL 2  —  Q path", fontsize=8.8, fontweight="bold",
             color=Q_C, va="bottom")
-    ax.plot([3 + 5 * (w + gap), 3 + 9 * (w + gap) - gap], [15.4, 15.4], color=KV_C, lw=2.0)
-    ax.text(3 + 5 * (w + gap), 16.4, "KERNEL 3  —  attention", fontsize=8.8,
+    ax.plot([x0 + 5 * (w + gap), x0 + 9 * (w + gap) - gap], [yr, yr], color=KV_C,
+            lw=2.0)
+    ax.text(x0 + 5 * (w + gap), yr + 1.0, "KERNEL 3  —  attention", fontsize=8.8,
             fontweight="bold", color=KV_C, va="bottom")
 
     fig.savefig(os.path.join(OUT, "fig0_pipeline.png"), dpi=190, facecolor=SURFACE,
@@ -263,7 +335,8 @@ def steps():
         "step_2a1", 11,
         "Step 2a1   —   project the hidden state into the q_lora latent",
         "q_lat  =  x @ W_q_a",
-        "the first half of the factorised Q projection",
+        "first half of the factorised Q projection.   7,168 = hidden, the model's residual width (one row per token).   "
+        "1,536 = q_lora_rank, the rank the projection is factored through.",
         ("x", 128, 7168, Q_C),
         ("W_q_a", 7168, 1536, W_C),
         ("q_lat", 128, 1536, NEUT, (128, 128), "grid.x = 12 col tiles"),
@@ -420,17 +493,18 @@ def steps():
 # RESULTS
 # =============================================================================
 def fig_results():
+    # ordered worst-to-best speedup, so the bars read as a ramp
     data = [
-        ("decode_speculative_2tok",      2.59,   3.65),
-        ("prefill_chat_batch",          69.95,  93.56),
-        ("decode_single_user_long_ctx",  1.92,   2.57),
-        ("decode_speculative_4tok",      6.10,   8.07),
-        ("prefill_chunk_2k",            92.57, 119.79),
-        ("decode_serving_avg_ctx",      14.14,  18.11),
-        ("decode_serving_high_batch",   12.79,  16.11),
-        ("decode_speculative_long_ctx", 46.83,  58.41),
-        ("prefill_chunk_4k",           351.10, 437.59),
-        ("decode_serving_long_ctx",     23.43,  28.40),
+        ("decode_speculative_2tok",      2.61,   3.49),
+        ("decode_single_user_long_ctx",  1.93,   2.46),
+        ("prefill_chat_batch",          70.58,  90.30),
+        ("decode_speculative_4tok",      6.16,   7.70),
+        ("prefill_chunk_2k",            94.19, 114.70),
+        ("decode_serving_avg_ctx",      14.27,  17.09),
+        ("decode_serving_high_batch",   12.94,  15.30),
+        ("prefill_chunk_4k",           355.87, 420.43),
+        ("decode_speculative_long_ctx", 47.22,  55.36),
+        ("decode_serving_long_ctx",     23.64,  26.68),
     ]
     fig = plt.figure(figsize=(10, 5.8))
     ax = fig.add_axes([0.30, 0.17, 0.64, 0.68])
@@ -462,14 +536,14 @@ def fig_results():
     ax.tick_params(length=0)
     ax.xaxis.grid(True, color=GRID, lw=0.9, zorder=0)
     ax.set_axisbelow(True)
-    fig.text(0.03, 0.955, "End-to-end result: 0.77x geometric mean", fontsize=14.5,
+    fig.text(0.03, 0.955, "End-to-end result: 0.82x geometric mean", fontsize=14.5,
              fontweight="bold", color=INK, va="top")
     fig.text(0.03, 0.895,
              "FP32, RTX A6000, L2 flushed between iterations, TF32 disabled on both sides.  "
              "All 10 scenarios pass correctness.", fontsize=8.6, color=INK2, va="top")
     fig.text(0.30, 0.025,
              "Decode (aqua) and prefill (blue) land in the same narrow band: the tiling "
-             "generalises, but cuBLAS keeps a ~23% edge.", fontsize=8.2, color=INK2)
+             "generalises, but cuBLAS keeps a ~18% edge.", fontsize=8.2, color=INK2)
     fig.savefig(os.path.join(OUT, "fig_results.png"), dpi=190, facecolor=SURFACE,
                 bbox_inches="tight", pad_inches=0.14)
     return fig
