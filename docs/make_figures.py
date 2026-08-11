@@ -253,8 +253,8 @@ def fig_idea():
 # OVERVIEW 2 — the 9 steps at a glance
 # =============================================================================
 def fig_pipeline():
-    fig, ax = canvas(15.0, 5.3)
-    H = 100 * 5.3 / 15.0
+    fig, ax = canvas(15.0, 6.0)
+    H = 100 * 6.0 / 15.0
     ax.text(3, H - 2.6, "The 9 steps", fontsize=14, fontweight="bold", va="top",
             color=INK)
     ax.text(3, H - 6.8,
@@ -266,20 +266,24 @@ def fig_pipeline():
 
     # tag, the operation on the matrices, operands in, operands out, colour.
     # Every matrix in a product is listed separately, with its own dimensions.
+    # A line starting with "=" breaks the dimension above it down into the factors
+    # the next step splits it along, so the chain stays readable across reshapes.
     steps = [
         ("2a1",  "x @ W_q_a",
          ["x  128x7168", "W_q_a  7168x1536"], ["q_lat  128x1536"], Q_C),
         ("2a-n", "RMSNorm(q_lat)",
          ["q_lat  128x1536"], ["q_lat  128x1536"], NEUT),
         ("2a2",  "q_lat @ W_q_b",
-         ["q_lat  128x1536", "W_q_b  1536x24576"], ["q_raw  128x24576"], Q_C),
+         ["q_lat  128x1536", "W_q_b  1536x24576"],
+         ["q_raw  128x24576", "= 128 x 128h x 192"], Q_C),
         ("2b",   "RoPE on q[128:192]",
-         ["q_raw  128x128x192"], ["q_rope  128x128x64"], NEUT),
+         ["q_raw  128x128x192", "= 128 nope + 64 rope"],
+         ["q_rope  128x128x64"], NEUT),
         ("2c",   "q_nope @ W_uk[h]",
          ["q_nope  128x128x128", "W_uk[h]  128x512"],
          ["q_absorbed  128x128x512"], Q_C),
         ("3a",   "q @ cache^T, then exp",
-         ["q  16384x576", "cache^T  576x4989"],
+         ["q  16384x576", "= (128x128h) x (512+64)", "cache^T  576x4989"],
          ["scores  16384x4989", "m,l  16384x39"], KV_C),
         ("3b",   "max, then exp(m-M)",
          ["m,l  16384x39"], ["alpha  16384x39", "row_sum  16384"], NEUT),
@@ -290,7 +294,7 @@ def fig_pipeline():
     ]
     w, gap = 9.3, 1.2
     x0 = 3.0
-    ybox, hbox = 11.0, 7.6
+    ybox, hbox = 15.0, 7.6
     for i, (n, o, d_in, d_out, c) in enumerate(steps):
         x = x0 + i * (w + gap)
         xc = x + w / 2.0
@@ -300,11 +304,16 @@ def fig_pipeline():
         ax.text(xc, ybox + 1.7, o, ha="center", fontsize=6.4, color=INK2)
         y = ybox - 1.9
         for lbl in d_in:
-            ax.text(xc, y, lbl, ha="center", fontsize=6.0, color=MUTED)
-            y -= 2.3
+            brk = lbl.startswith("=")
+            ax.text(xc, y, lbl, ha="center", fontsize=5.7 if brk else 6.0,
+                    color=MUTED, style="italic" if brk else "normal")
+            y -= 2.0 if brk else 2.3
         for lbl in d_out:
-            ax.text(xc, y, "-> " + lbl, ha="center", fontsize=6.0, color=c)
-            y -= 2.3
+            brk = lbl.startswith("=")
+            ax.text(xc, y, lbl if brk else "-> " + lbl, ha="center",
+                    fontsize=5.7 if brk else 6.0, color=MUTED if brk else c,
+                    style="italic" if brk else "normal")
+            y -= 2.0 if brk else 2.3
         if i:
             ax.add_patch(FancyArrowPatch((x - gap + 0.2, ybox + hbox / 2.0),
                                          (x - 0.2, ybox + hbox / 2.0),
@@ -335,8 +344,7 @@ def steps():
         "step_2a1", 11,
         "Step 2a1   —   project the hidden state into the q_lora latent",
         "q_lat  =  x @ W_q_a",
-        "first half of the factorised Q projection.   7,168 = hidden, the model's residual width (one row per token).   "
-        "1,536 = q_lora_rank, the rank the projection is factored through.",
+        "first half of the factorised Q projection.   7,168 = hidden.   1,536 = q_lora_rank.",
         ("x", 128, 7168, Q_C),
         ("W_q_a", 7168, 1536, W_C),
         ("q_lat", 128, 1536, NEUT, (128, 128), "grid.x = 12 col tiles"),
@@ -495,16 +503,16 @@ def steps():
 def fig_results():
     # ordered worst-to-best speedup, so the bars read as a ramp
     data = [
-        ("decode_speculative_2tok",      2.61,   3.49),
-        ("decode_single_user_long_ctx",  1.93,   2.46),
-        ("prefill_chat_batch",          70.58,  90.30),
-        ("decode_speculative_4tok",      6.16,   7.70),
-        ("prefill_chunk_2k",            94.19, 114.70),
-        ("decode_serving_avg_ctx",      14.27,  17.09),
-        ("decode_serving_high_batch",   12.94,  15.30),
-        ("prefill_chunk_4k",           355.87, 420.43),
-        ("decode_speculative_long_ctx", 47.22,  55.36),
-        ("decode_serving_long_ctx",     23.64,  26.68),
+        ("decode_speculative_2tok",      2.59,   3.38),
+        ("decode_single_user_long_ctx",  1.91,   2.39),
+        ("prefill_chat_batch",          70.55,  87.32),
+        ("decode_speculative_4tok",      6.16,   7.53),
+        ("prefill_chunk_2k",            94.15, 113.11),
+        ("decode_serving_avg_ctx",      14.27,  16.92),
+        ("prefill_chunk_4k",           355.46, 417.61),
+        ("decode_serving_high_batch",   12.91,  15.06),
+        ("decode_speculative_long_ctx", 47.19,  54.90),
+        ("decode_serving_long_ctx",     23.61,  26.55),
     ]
     fig = plt.figure(figsize=(10, 5.8))
     ax = fig.add_axes([0.30, 0.17, 0.64, 0.68])
@@ -536,14 +544,14 @@ def fig_results():
     ax.tick_params(length=0)
     ax.xaxis.grid(True, color=GRID, lw=0.9, zorder=0)
     ax.set_axisbelow(True)
-    fig.text(0.03, 0.955, "End-to-end result: 0.82x geometric mean", fontsize=14.5,
+    fig.text(0.03, 0.955, "End-to-end result: 0.83x geometric mean", fontsize=14.5,
              fontweight="bold", color=INK, va="top")
     fig.text(0.03, 0.895,
              "FP32, RTX A6000, L2 flushed between iterations, TF32 disabled on both sides.  "
              "All 10 scenarios pass correctness.", fontsize=8.6, color=INK2, va="top")
     fig.text(0.30, 0.025,
              "Decode (aqua) and prefill (blue) land in the same narrow band: the tiling "
-             "generalises, but cuBLAS keeps a ~18% edge.", fontsize=8.2, color=INK2)
+             "generalises, but cuBLAS keeps a ~17% edge.", fontsize=8.2, color=INK2)
     fig.savefig(os.path.join(OUT, "fig_results.png"), dpi=190, facecolor=SURFACE,
                 bbox_inches="tight", pad_inches=0.14)
     return fig

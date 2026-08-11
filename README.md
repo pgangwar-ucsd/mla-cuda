@@ -10,7 +10,7 @@ nope   = 128      rope       = 64      qk_head_dim   = 192     v_head_dim  = 128
 Q_absorbed  = 512 + 64 = 576
 ```
 
-**Results:** CUDA kernel runs at a **geometric-mean 0.82× of the PyTorch/cuBLAS
+**Results:** CUDA kernel runs at a **geometric-mean 0.83× of the PyTorch/cuBLAS
 baseline**. See [Benchmarks](#3-benchmarks).
 
 ## Contents
@@ -57,28 +57,58 @@ Shapes throughout are for **batch-128 decode**: `B=128, Sq=1, H=128`, so
 `bq = B·Sq = 128` rows and `flat = B·Sq·H = 16,384` rows, at DeepSeek's reported
 production-average cache depth `Sk = 4,989`.
 
-### The GEMM Recipe
+### High-Throughput GEMM Recipe
 
 Five kernels across six of the nine steps (2a1, 2a2, 2c, 3a, 3c, 3d) are the same GEMM shape and
 use one recipe, so the per-step notes below only list what is *specific* to that
 step:
 
-- **128×128 output tile per thread block** - `16×16 = 256` threads per block, **8×8 
-  outputs per thread**. An M×N register tile costs M+N shared-memory loads per M·N FMAs, 
+- **Coalescing** - All operand traffic is contiguous and line-aligned. Three
+  things enable this: `threadIdx.x` indexes the contiguous axis on the staging loads 
+  as well as the stores; each thread's 8 outputs are strided by `blockDim.x`, so one store instruction has the warp's lanes writing *adjacent* floats; and row strides are kept a 
+  multiple of 32 floats, so every row starts on a 128 B line (padded for `scores`,
+  whose width is `Sk` and not always line-aligned). 
+- **Bank-conflict-free shared memory** - Row padding by `+1` rather than an XOR
+  swizzle. Padding keeps the address *linear* in the reduction
+  index, so addressing is a base pointer plus immediate offsets instead of an XOR
+  and an add per operand per step. This reduces the ALU pressure,
+  and it frees registers — a swizzle keeps its mask and permuted index live across
+  the *entire* reduction, every such value is one the scheduler cannot spend on 
+  prefetching the next operand.
+- **64x ILP per thread** - `16×16 = 256` threads per block, **8×8 
+  outputs per thread**, resulting in `128×128 output tile per thread block`. An M×N register tile costs M+N shared-memory loads per M·N FMAs, 
   so 8×8 gives 0.25 loads/FMA — sm_86 issues 128 FP32 lanes per SM against 32 shared-memory
   words (4 Bytes) per clock, i.e. it wants exactly 4 FMAs per loaded word.
-- **The contracted dimension is walked 32 at a time** - A block's 128×128 output
-  tile is a dot product over 32-deep chunks: all 256 threads cooperatively stage a 
-  `[128 × 32]` slab of each operand into shared memory, barrier, reduce that slab into 
-  the register tiles, barrier, repeat. 32 is the largest chunk that keeps **2 blocks resident per SM**
-  — `(128 + 128) × 33 × 4 B = 33.8 KB` per block, so 67.6 KB of the SM's 100 KB,
-  and 32 floats is exactly a 128 B cache line, so each staged row is one aligned transaction.
-- **Split-K when the output alone cannot fill the GPU** - A 128×128 output tile
+- **Occupancy traded for ILP** - The 8×8 tile requiress 64 accumulator registers, with 
+  operands, addressing, bounds and loop state accounting consuming to **107 to 128**
+  registers per thread. `__launch_bounds__(256, 2)` caps a thread at
+  `65,536 / 512 = 128 registers`, so all kernels fit without spilling.
+- **Split-K when the output cannot fill the GPU** - A 128×128 output tile
   means a small output yields few blocks: 2a1's 1536 columns are 12 tiles, and the
   `bq` dimension collapses to a single tile for any `bq_total ≤ 128` — most of
   decode — so the launch would occupy 12 of 84 SMs. Split-K adds a grid dimension
   over the *reduction* instead: each slice takes a disjoint span of it, accumulates
   its own partial, and `atomicAdd`s into a pre-zeroed output.
+- **Tiling of contracted dimension** - A block's 128×128 output
+  tile is a dot product over 32-deep chunks: all 256 threads cooperatively stage a 
+  `[128 × 32]` slab of each operand into shared memory, barrier, reduce that slab into 
+  the register tiles, barrier, repeat. 32 is the largest chunk that keeps **2 blocks resident per SM**
+  — `(128 + 128) × 33 × 4 B = 33.8 KB` per block, so 67.6 KB of the SM's 100 KB,
+  and 32 floats is exactly a 128 B cache line, so each staged row is one aligned transaction.
+- **Staging loops strength-reduced to one multiply per element** - Every staging
+  loop walks `idx += 256` and splits it with `idx / D` and `idx % D`, for `D` of
+  32 (reduction-tile loops) or 128 (column-tile loops). 256 is a multiple of
+  both, so `idx % D` never changes across passes: that index and the
+  `< tile_len` predicate built on it are loop-invariant and hoist out of the loop
+  entirely, the *other* index then advances by a constant so its bound becomes a
+  trip count rather than a per-element compare, and every block-invariant offset
+  folds into a base pointer once. What is left in the body is one row multiply,
+  one load and one store — against a shift, a mask, two compares, a source select
+  and a runtime-stride `IMAD` before. Worth **0.77× → 0.83×** end to end. Note
+  what it is *not*: register pressure barely moved, and unrolling the reduction
+  strip (which does cut registers, 127 → 110 on 3a) buys nothing. The strip is
+  already at the shared-memory bandwidth ceiling, so rescheduling the same work
+  cannot help — only issuing less of it.
 - **Bounds check during results write-out** - A block always computes its whole 
   128×128 tile, even when the real matrix has fewer rows or columns than that. 
   The threads holding the leftover slots read whatever happens to be in shared 
@@ -89,22 +119,6 @@ step:
   launch. The thread block is always 16×16 threads and `threadIdx.y` walks rows, so 
   if each of those 16 columns owns `kBqReg` rows the tile is `16 × kBqReg` = 16, 32, 
   64 or 128 rows, and a thread's accumulator block is `kBqReg × 8`. A single-stream decode has exactly one real row, so a 128-row tile would do 128 rows of work to keep 1. `bq_reg_for()` therefore picks the **smallest tile that still covers `bq_total`**: 16 at `bq = 1` (the floor, since `blockDim.y = 16`), 32 at `bq = 20`, etc., freeing up registers to increase occupancy.
-- **Coalescing** - All operand traffic is contiguous and line-aligned. Three
-  things enable this: `threadIdx.x` indexes the contiguous axis on the staging loads 
-  as well as the stores; each thread's 8 outputs are strided by `blockDim.x`, so one store instruction has the warp's lanes writing *adjacent* floats; and row strides are kept a 
-  multiple of 32 floats, so every row starts on a 128 B line (padded for `scores`,
-  whose width is `Sk` and not always line-aligned). 
-- **Occupancy traded for ILP** - The 8×8 tile requiress 64 accumulator registers, with 
-  operands, addressing, bounds and loop state accounting consuming to **107 to 128**
-  registers per thread. `__launch_bounds__(256, 2)` caps a thread at
-  `65,536 / 512 = 128 registers`, so all kernels fit without spilling.
-- **Bank-conflict-free shared memory** - Row padding by `+1` rather than an XOR
-  swizzle. Padding keeps the address *linear* in the reduction
-  index, so addressing is a base pointer plus immediate offsets instead of an XOR
-  and an add per operand per step. This reduces the ALU pressure,
-  and it frees registers — a swizzle keeps its mask and permuted index live across
-  the *entire* reduction, every such value is one the scheduler cannot spend on 
-  prefetching the next operand.
 
 ---
 
@@ -116,11 +130,9 @@ step:
 
 - **Low-rank factorization (algorithmic).** This step exists only because the Q
   projection is factored through `q_lora_rank = 1536` rather than applied as one
-  dense `[7168, 24576]` matrix. Together with 2a2 that is 48.8 M weights instead
-  of 176 M — **195 MB instead of 704 MB**. At single-stream decode this is a
-  GEMV, so runtime is weight bytes ÷ bandwidth and nothing else.
+  dense `[7168, 24576]` matrix in the next step.
 - **Split-K over the 7,168 reduction.** The output is only 1536 columns = 12
-  block tiles, so without it this step runs 12 blocks on an 84-SM GPU.
+  block tiles, so without Split-K this step runs 12 blocks on an 84-SM GPU.
 
 ## Step 2a-norm — RMSNorm on the Latent
 
@@ -128,9 +140,13 @@ step:
 
 **Techniques Specific to This Step**
 
-- **Single-kernel block reduction.** One block per row, warp shuffles then one
-  pass over the per-warp partials — no second launch and no global round-trip
-  for the mean.
+- **Single-kernel block reduction.** One block owns a whole row — 1,536 values
+  across 256 threads, 6 each — so the RMS never leaves the block. Each thread sums
+  its own squares, `__shfl_down` collapses each warp of 32 down to one number
+  (8 warps, so 8 partial sums), those 8 go through shared memory, and warp 0 runs
+  one more shuffle round over them to finish the total. Two barriers in all: no
+  shared-memory reduction tree, no second kernel launch, and the mean never
+  round-trips through global memory.
 - **Accumulate wide, hand off narrow.** Reads 2a1's fp32 accumulator and writes
   the input dtype, which is what lets 2a2 reuse the same GEMM kernel unchanged.
 - The norm is **load-bearing, not incidental**: with nothing between them,
@@ -200,19 +216,12 @@ step:
 - **Output row-stride padded to 128 B lines.** A row stride that is not a whole
   cache line makes every row start at a different offset; padding took store
   sectors per request from **5.75 → 4.00**.
-- **Staging loops strength-reduced to one multiply per element** (3c does the
-  same). Walking the staging index as `idx += 256` and splitting it with
-  `idx / 32` and `idx % 32` costs a shift, a mask, two bounds compares, a
-  two-way source select and a runtime-stride `IMAD` on *every* staged element.
-  But 256 is a multiple of 32, so `idx % 32` never changes — the column index and
-  its `< tile_len` predicate are loop-invariant and hoist out entirely, the row
-  index then advances by a constant so its bound becomes a trip count rather than
-  a compare, and every block-invariant offset (`flat_base`, the batch stride,
-  `k0`, `r_base`) folds into a base pointer once. What is left in the loop is one
-  row multiply, one load and one store. This is what took 3a from 127 to 107
-  registers and the suite from 0.77× to 0.82× — not the register count, which
-  unrolling also cut with no effect, but the instructions no longer competing for
-  issue slots with the shared-memory traffic.
+- **The merged reduction costs nothing at the staging loop.** Because both
+  operand pairs are contiguous in `r` and the rope/nope choice is uniform across
+  the block, the shared recipe's base-pointer folding resolves that two-way
+  source select *once per reduction tile* rather than per staged element. Both
+  of this kernel's staging loops also split by the same 32, so they share one
+  invariant column index and one hoisted predicate. 3a ends at 107 registers.
 
 ## Step 3b — Reconcile the Per-Block Softmax Maxima
 
@@ -292,19 +301,19 @@ both sides measure the cold-cache behaviour a real decode step sees.
 
 | Scenario | Phase | B | Sq | Sk | Base ms | Fused ms | Speedup |
 |---|---|--:|--:|--:|--:|--:|--:|
-| `decode_single_user_long_ctx` | decode | 1 | 1 | 65536 | 1.93 | 2.46 | 0.78× |
-| `decode_serving_avg_ctx` | decode | 128 | 1 | 4989 | 14.27 | 17.09 | 0.83× |
-| `decode_serving_long_ctx` | decode | 128 | 1 | 8192 | 23.64 | 26.68 | 0.89× |
-| `decode_serving_high_batch` | decode | 256 | 1 | 2048 | 12.94 | 15.30 | 0.85× |
-| `decode_speculative_2tok` | decode | 64 | 2 | 512 | 2.61 | 3.49 | 0.75× |
-| `decode_speculative_4tok` | decode | 64 | 4 | 768 | 6.16 | 7.70 | 0.80× |
-| `decode_speculative_long_ctx` | decode | 132 | 4 | 4096 | 47.22 | 55.36 | 0.85× |
-| `prefill_chat_batch` | prefill | 8 | 512 | 512 | 70.58 | 90.30 | 0.78× |
-| `prefill_chunk_2k` | prefill | 1 | 2048 | 2048 | 94.19 | 114.70 | 0.82× |
-| `prefill_chunk_4k` | prefill | 1 | 4096 | 4096 | 355.87 | 420.43 | 0.85× |
+| `decode_single_user_long_ctx` | decode | 1 | 1 | 65536 | 1.91 | 2.39 | 0.80× |
+| `decode_serving_avg_ctx` | decode | 128 | 1 | 4989 | 14.27 | 16.92 | 0.84× |
+| `decode_serving_long_ctx` | decode | 128 | 1 | 8192 | 23.61 | 26.55 | 0.89× |
+| `decode_serving_high_batch` | decode | 256 | 1 | 2048 | 12.91 | 15.06 | 0.86× |
+| `decode_speculative_2tok` | decode | 64 | 2 | 512 | 2.59 | 3.38 | 0.77× |
+| `decode_speculative_4tok` | decode | 64 | 4 | 768 | 6.16 | 7.53 | 0.82× |
+| `decode_speculative_long_ctx` | decode | 132 | 4 | 4096 | 47.19 | 54.90 | 0.86× |
+| `prefill_chat_batch` | prefill | 8 | 512 | 512 | 70.55 | 87.32 | 0.81× |
+| `prefill_chunk_2k` | prefill | 1 | 2048 | 2048 | 94.15 | 113.11 | 0.83× |
+| `prefill_chunk_4k` | prefill | 1 | 4096 | 4096 | 355.46 | 417.61 | 0.85× |
 
-**Average: 0.82× geometric mean** (0.82× arithmetic, 0.84× aggregate
-Σbase/Σfused); 0.82× for the seven decode shapes and for the three prefill shapes
+**Average: 0.83× geometric mean** (0.83× arithmetic, 0.84× aggregate
+Σbase/Σfused); 0.83× for the seven decode shapes and for the three prefill shapes
 alike.
 
 Absolute milliseconds on this box drift by up to ~15% with GPU thermal state,
@@ -320,26 +329,30 @@ taken.
 
 | step | sum ms | share |
 |---|--:|--:|
-| **3a** scores | 54.84 | **43.9%** |
-| **3c** ctx | 49.76 | **39.9%** |
-| **2a1 + 2a2** Q projection | 13.20 | 10.6% |
-| 3d output | 2.74 | 2.2% |
-| 2c absorb | 2.44 | 2.0% |
+| **3a** scores | 55.73 | **44.5%** |
+| **3c** ctx | 50.52 | **40.3%** |
+| **2a1 + 2a2** Q projection | 12.58 | 10.0% |
+| 3d output | 2.49 | 2.0% |
+| 2c absorb | 2.17 | 1.7% |
 | ATen `.contiguous()` copies and fills | 1.57 | 1.3% |
 | 2b RoPE + 2a-norm | 0.19 | 0.2% |
-| 3b combine | 0.11 | 0.1% |
-| **TOTAL** | **124.85** | 100% |
+| 3b combine | 0.12 | 0.1% |
+| **TOTAL** | **125.36** | 100% |
 
-**3a + 3c are 84% of decode.** Both are limited by shared-memory bandwidth, not
+**3a + 3c are 85% of decode.** Both are limited by shared-memory bandwidth, not
 by occupancy or instruction scheduling: at 0.25 loads/FMA the 8×8 register tile
 asks for 32 shared-memory words per clock against the 32 that sm_86 can deliver,
 so the reduction strip has no headroom to schedule into. Measured against that
 model — unrolling the strip by 2, 4 or 8 compiles without spilling and drops 3a
 from 127 to 110 registers, yet moves the benchmark by less than 1%, because
 extra ILP has nothing to hide behind. What *did* move it was removing issued
-work from the staging loops (see Step 3a): measured as a matched before/after
-pair on one GPU in one session, that is 0.77× → 0.82× geometric mean, −5.7%
-fused time averaged over the ten scenarios and faster on every one of them.
+work from the staging loops (see the GEMM recipe): measured as a matched
+before/after pair on one GPU in one session, that is 0.77× → 0.83× geometric
+mean, −7.3% fused time averaged over the ten scenarios and faster on every one
+of them. Applied to 3a and 3c first (−5.7%), then 2a1/2a2 and 2c (−1.3%), then
+3d (−0.5%) — the gains track each step's share of the total, and land hardest on
+the shapes where a narrow `bq` tile leaves the reduction strip with the least
+work to hide the staging behind.
 
 ---
 

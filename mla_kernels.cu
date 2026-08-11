@@ -271,35 +271,40 @@ q_raw_gemm_kernel(
     const int lb0 = threadIdx.y;
     const int ln0 = threadIdx.x;
 
+    // Staging geometry, invariant over the reduction — same argument as 3a. Both loops
+    // step idx by coop_stride = 256 against a power-of-two modulus, so the idx%% term
+    // never changes across passes and the predicate built on it hoists out; the other
+    // index then advances by a constant, which turns its bound into a trip count; and
+    // every offset except the row multiply folds into a base pointer.
+    const int tid       = threadIdx.x + threadIdx.y * kTileThreadsX;
+    const int k_local_x = tid & (kQHiddenTile - 1);      // x side: invariant column
+    const int lb_start  = tid / kQHiddenTile;
+    const int lb_step   = coop_stride / kQHiddenTile;    // 8 bq rows per pass
+    const int lb_end    = min(kBqTile, bq_total - bq_base);
+    const int ln_s      = tid & (kQWqColTile - 1);       // W_q side: invariant column
+    const int n_s       = n_base + ln_s;
+    const int wk_start  = tid / kQWqColTile;
+    const int wk_step   = coop_stride / kQWqColTile;     // 2 reduction rows per pass
+
     for (int k0 = k_begin; k0 < k_end; k0 += kQHiddenTile) {
         const int tile_len =
             (k0 + kQHiddenTile <= k_end) ? kQHiddenTile : (k_end - k0);
 
-        // stage x[bq_base:+kBqTile, k0:+tile) — k contiguous so warps coalesce.
-        // Full-tile extent, not tile_len, so the div/mod fold to shift and mask
-        // rather than a runtime integer division; a short trailing tile is handled by
-        // predicating the store.
-        const int x_elems = kBqTile * kQHiddenTile;
-        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
-             idx < x_elems; idx += coop_stride) {
-            const int lb_s    = idx / kQHiddenTile;
-            const int k_local = idx % kQHiddenTile;
-            const int bq_s    = bq_base + lb_s;
-            if (bq_s < bq_total && k_local < tile_len)
-                x_smem[lb_s * kQHiddenPad + k_local] =
-                    static_cast<acc_t>(x[bq_s * hidden_dim + k0 + k_local]);
+        // stage x[bq_base:+kBqTile, k0:+tile) — k contiguous so warps coalesce
+        if (k_local_x < tile_len) {
+            const scalar_t* x_src = x + bq_base * hidden_dim + k0 + k_local_x;
+            for (int lb_s = lb_start; lb_s < lb_end; lb_s += lb_step)
+                x_smem[lb_s * kQHiddenPad + k_local_x] =
+                    static_cast<acc_t>(x_src[lb_s * hidden_dim]);
         }
 
-        // stage W_q[k0:+tile, n_base:+128) — n contiguous → ln_s = idx % kQWqColTile
-        const int w_elems = tile_len * kQWqColTile;
-        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
-             idx < w_elems; idx += coop_stride) {
-            const int k_local = idx / kQWqColTile;
-            const int ln_s    = idx % kQWqColTile;
-            const int n_s     = n_base + ln_s;
-            if (k_local < tile_len && n_s < n_total)
+        // stage W_q[k0:+tile, n_base:+128) — n contiguous, so the column is the
+        // invariant index here and the reduction row is what walks
+        if (n_s < n_total) {
+            const scalar_t* w_src = W_q + k0 * n_total + n_s;
+            for (int k_local = wk_start; k_local < tile_len; k_local += wk_step)
                 w_smem[ln_s * kQHiddenPad + k_local] =
-                    static_cast<acc_t>(W_q[(k0 + k_local) * n_total + n_s]);
+                    static_cast<acc_t>(w_src[k_local * n_total]);
         }
         __syncthreads();
 
@@ -506,37 +511,37 @@ q_absorb_kernel(
     const int lb0 = threadIdx.y;
     const int lr0 = threadIdx.x;
 
+    // Staging geometry, invariant over the reduction — see the note in 2a / 3a.
+    const int tid       = threadIdx.x + threadIdx.y * kTileThreadsX;
+    const int n_local_q = tid & (kQNopeTile - 1);        // q_raw side: invariant column
+    const int lb_start  = tid / kQNopeTile;
+    const int lb_step   = coop_stride / kQNopeTile;      // 8 bq rows per pass
+    const int lb_end    = min(kBqTile, bq_total - bq_base);
+    const int lr_s      = tid & (kQRankTile - 1);        // W_uk side: invariant rank
+    const int r_s       = r_base + lr_s;
+    const int wn_start  = tid / kQRankTile;
+    const int wn_step   = coop_stride / kQRankTile;      // 2 nope rows per pass
+    const int q_row     = num_heads * qk_head_dim;       // q_raw row stride
 
     for (int n0 = 0; n0 < nope_dim; n0 += kQNopeTile) {
         const int tile_len =
             (n0 + kQNopeTile <= nope_dim) ? kQNopeTile : (nope_dim - n0);
 
-        // stage q_raw[bq, h, n0:+tile) — n contiguous so warps coalesce.
-        // Full-tile extent, not tile_len, so the div/mod fold to shift and mask
-        // rather than a runtime integer division; a short trailing tile is handled by
-        // predicating the store. 
-        const int qn_elems = kBqTile * kQNopeTile;
-        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
-             idx < qn_elems; idx += coop_stride) {
-            const int lb_s    = idx / kQNopeTile;
-            const int n_local = idx % kQNopeTile;
-            const int bq_s    = bq_base + lb_s;
-            if (bq_s < bq_total && n_local < tile_len)
-                qn_smem[lb_s * kQNopePad + n_local] =
-                    q_raw[bq_s * (num_heads * qk_head_dim) + qn_head_base + n0 + n_local];
+        // stage q_raw[bq, h, n0:+tile) — n contiguous so warps coalesce
+        if (n_local_q < tile_len) {
+            const acc_t* q_src =
+                q_raw + bq_base * q_row + qn_head_base + n0 + n_local_q;
+            for (int lb_s = lb_start; lb_s < lb_end; lb_s += lb_step)
+                qn_smem[lb_s * kQNopePad + n_local_q] = q_src[lb_s * q_row];
         }
 
-        // stage W_uk[h, n0:+tile, r_base:+128) — r contiguous → lr_s = idx % kQRankTile
-        const int w_elems = tile_len * kQRankTile;
-        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
-             idx < w_elems; idx += coop_stride) {
-            const int n_local = idx / kQRankTile;
-            const int lr_s    = idx % kQRankTile;
-            const int r_s     = r_base + lr_s;
-            if (n_local < tile_len && r_s < kv_rank)
+        // stage W_uk[h, n0:+tile, r_base:+128) — r contiguous, so the rank is the
+        // invariant index here and the nope row is what walks
+        if (r_s < kv_rank) {
+            const scalar_t* w_src = W_uk + w_head_base + n0 * kv_rank + r_s;
+            for (int n_local = wn_start; n_local < tile_len; n_local += wn_step)
                 w_smem[lr_s * kQNopePad + n_local] =
-                    static_cast<acc_t>(
-                        W_uk[w_head_base + (n0 + n_local) * kv_rank + r_s]);
+                    static_cast<acc_t>(w_src[n_local * kv_rank]);
         }
         __syncthreads();
 
@@ -1385,40 +1390,36 @@ mla_output_smem_kernel(
     }
     __syncthreads();
 
+    // Staging geometry, invariant over the reduction — see the note in 3a. Both loops
+    // here split by kOutRankTile, so they share one invariant column index and one
+    // hoisted tile-length predicate, exactly as in 3a.
+    const int tid      = threadIdx.x + threadIdx.y * kTileThreadsX;
+    const int r_local  = tid & (kOutRankTile - 1);
+    const int st_start = tid / kOutRankTile;
+    const int st_step  = coop_stride / kOutRankTile;   // 8 rows per pass
+    const int lb_end   = min(kBqTile,   bq_total - bq_base);
+    const int ld_end   = min(kOutVTile, v_dim - d_base);
+    const int ctx_row  = num_heads * kv_rank;          // ctx row stride
+
     for (int r0 = 0; r0 < kv_rank; r0 += kOutRankTile) {
         const int tile_len =
             (r0 + kOutRankTile <= kv_rank) ? kOutRankTile : (kv_rank - r0);
 
-        // stage ctx[bq_base:+kBqTile, h, r0:+tile) — r contiguous so warps coalesce.
-        // Full-tile extent, not tile_len, so the div/mod fold to a shift and a mask
-        // rather than a runtime integer division; a short trailing tile is handled by
-        // predicating the store. Measured 26% off mla_scores_kernel back when that kernel
-        // staged this way; 3a and 3c have since hoisted the div/mod out of the loop
-        // entirely (see mla_scores_kernel), which this kernel has not yet been given.
-        const int ctx_elems = kBqTile * kOutRankTile;
-        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
-             idx < ctx_elems; idx += coop_stride) {
-            const int lb_s    = idx / kOutRankTile;
-            const int r_local = idx % kOutRankTile;
-            const int bq_s    = bq_base + lb_s;
-            if (bq_s < bq_total && r_local < tile_len)
+        if (r_local < tile_len) {
+            // stage ctx[bq_base:+kBqTile, h, r0:+tile) — r contiguous so warps coalesce
+            const ctx_t* ctx_src =
+                ctx + bq_base * ctx_row + ctx_head_base + r0 + r_local;
+            for (int lb_s = st_start; lb_s < lb_end; lb_s += st_step)
                 ctx_smem[lb_s * kOutRankPad + r_local] =
-                    static_cast<acc_t>(
-                        ctx[(bq_s * num_heads) * kv_rank + ctx_head_base + r0 + r_local])
+                    static_cast<acc_t>(ctx_src[lb_s * ctx_row])
                     * inv_l_smem[lb_s];   // the deferred softmax divide
-        }
 
-        // stage W_uv[h, d_base:+128, r0:+tile) — reused by every bq in this block
-        const int w_elems = kOutVTile * kOutRankTile;
-        for (int idx = threadIdx.x + threadIdx.y * kTileThreadsX;
-             idx < w_elems; idx += coop_stride) {
-            const int ld_s    = idx / kOutRankTile;
-            const int r_local = idx % kOutRankTile;
-            const int d_s     = d_base + ld_s;
-            if (d_s < v_dim && r_local < tile_len)
+            // stage W_uv[h, d_base:+128, r0:+tile) — reused by every bq in this block
+            const scalar_t* w_src =
+                W_uv + w_head_base + d_base * kv_rank + r0 + r_local;
+            for (int ld_s = st_start; ld_s < ld_end; ld_s += st_step)
                 w_smem[ld_s * kOutRankPad + r_local] =
-                    static_cast<acc_t>(
-                        W_uv[w_head_base + d_s * kv_rank + r0 + r_local]);
+                    static_cast<acc_t>(w_src[ld_s * kv_rank]);
         }
         __syncthreads();
 
