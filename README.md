@@ -140,18 +140,23 @@ step:
 
 **Techniques Specific to This Step**
 
+- **Normalization to break matrices (algorithmic).** Matmul is associative, so with
+  nothing between them `(x @ W_q_a) @ W_q_b` equals `x @ (W_q_a @ W_q_b)` — one
+  precomputable `[7168, 24576]` matrix. What you would lose is *meaning*: the pair 
+  would carry no more expressive power than a single rank-1536 linear layer, and the
+  latent between them would have no fixed identity, since for any invertible
+  `G [1536, 1536]` the pair `(W_q_a G, G⁻¹ W_q_b)` computes the identical function.
+  RMSNorm removes that freedom: its scale is `rsqrt(mean(q_lat²))`, taken from the
+  row's own values, so it acts in one specific basis and cannot be absorbed into
+  either weight. The learnable `gain` *is* linear and could be folded into `W_q_b`;
+  only the data-dependent factor does this work. 
 - **Single-kernel block reduction.** One block owns a whole row — 1,536 values
   across 256 threads, 6 each — so the RMS never leaves the block. Each thread sums
   its own squares, `__shfl_down` collapses each warp of 32 down to one number
   (8 warps, so 8 partial sums), those 8 go through shared memory, and warp 0 runs
-  one more shuffle round over them to finish the total. Two barriers in all: no
+  one more shuffle round over them to finish the total. Two barriers in all, no
   shared-memory reduction tree, no second kernel launch, and the mean never
   round-trips through global memory.
-- **Accumulate wide, hand off narrow.** Reads 2a1's fp32 accumulator and writes
-  the input dtype, which is what lets 2a2 reuse the same GEMM kernel unchanged.
-- The norm is **load-bearing, not incidental**: with nothing between them,
-  `W_q_a @ W_q_b` collapses into a single rank-1536 matrix and the factorization
-  can be undone.
 
 ## Step 2a2 — Expand the Latent into the Per-Head Query
 
@@ -159,14 +164,14 @@ step:
 
 **Techniques Specific to This Step**
 
-- **Kernel reuse.** Same templated GEMM as 2a1; only the shapes and the split-K
-  plan differ.
 - **Split-K sized against wave quantization.** 24576/128 = 192 blocks against
   84 SMs × 2 resident = 168 slots is **1.14 waves**: one full wave, then a tail
   wave leaving 144 slots idle — 43% of the machine. The planner targets ~8 waves,
   where the tail costs ~11%.
-- **Blocking over `bq`, not one block per (row, head)**, which would re-read this
-  weight once per row and turn 151 MB of traffic into 19.3 GB.
+- **Blocking over `bq`.** A block owns 128 output columns
+  for *all* 128 `bq` rows, so the grid is 192 column tiles by one row tile. These
+  192 blocks all read the same `q_lat`, which stays in L2, and take disjoint column
+  panels of `W_q_b`, so the weight is fetched only once across the grid.
 
 ## Step 2b — RoPE on the Rope Half
 

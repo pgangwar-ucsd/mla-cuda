@@ -76,8 +76,11 @@ def step_header(ax, H, tag, formula, note=None):
 
 
 def box_size(rows, cols, s):
+    """Rows and columns share one scale, so a contracted dimension is drawn the same
+    length on both operands -- q_lat's 1,536 columns match W_q_b's 1,536 rows. Only a
+    box past MAXH breaks that, and it is labelled truncated when it does."""
     w = cols * s
-    raw = rows * 2.0 * s
+    raw = rows * s
     return w, min(max(raw, MINT), MAXH), raw > MAXH
 
 
@@ -115,7 +118,7 @@ def matrix(ax, x, ymid, rows, cols, s, color, name, alpha=0.16,
     extra = None
     if cut:
         extra = "(rows truncated to fit)"
-    elif h == MINT and rows * 2.0 * s < MINT:
+    elif h == MINT and rows * s < MINT:
         extra = f"({rows} rows: a thin strip)"
     if extra:
         ax.text(x + w / 2, y - 4.3, extra, ha="center", va="top", fontsize=7.2,
@@ -142,7 +145,7 @@ def gemm_step(fname, width_in, tag, formula, note, A, B, C, footer, avail_w=88.0
     s = min((avail_w - gaps) / tot_cols, SMAX)
     maxh = max(box_size(M[1], M[2], s)[1] for M in (A, B, C))
 
-    H = HEAD + PAD_T + maxh + PAD_B + FOOT
+    H = (HEAD if note else HEAD - 5.0) + PAD_T + maxh + PAD_B + FOOT
     fig, ax = canvas(width_in, width_in * H / 100.0)
     step_header(ax, H, tag, formula, note)
     ymid = H - HEAD - PAD_T - maxh / 2.0
@@ -359,16 +362,13 @@ def steps():
                 "q_lat  :=  q_lat * rsqrt(mean(q_lat^2) + eps) * gain",
                 "row-wise; keeps the two matmuls from collapsing into one rank-1536 matrix")
     s = 60.0 / 1536
-    matrix(ax, 6, 12.0, 128, 1536, s, NEUT, "q_lat  (in and out)")
-    ax.text(6 + 60 + 6, 12.0,
+    matrix(ax, 6, 11.0, 128, 1536, s, NEUT, "q_lat  (in and out)")
+    ax.text(6 + 60 + 6, 11.0,
             "one CUDA block per row  ->  128 blocks\n"
             "256 threads cover 1,536 elements (6 each)\n"
-            "block-wide sum by warp shuffles, then one\n"
-            "pass over the per-warp partials",
+            "each warp of 32 shuffles down to one number\n"
+            "warp 0 then sums those 8 numbers into the total",
             va="center", fontsize=8.4, color=INK2)
-    ax.text(3, 2.0,
-            "Reads 2a1's wide fp32 accumulator and writes the narrow input dtype, which is what lets step 2a2 reuse the same GEMM kernel unchanged.",
-            fontsize=8.4, va="bottom", color=INK2)
     fig.savefig(os.path.join(OUT, "step_2an.png"), dpi=190, facecolor=SURFACE,
                 bbox_inches="tight", pad_inches=0.14)
     figs.append(fig)
@@ -378,7 +378,7 @@ def steps():
         "step_2a2", 11,
         "Step 2a2   —   expand the latent into the per-head query",
         "q_raw  =  q_lat @ W_q_b            (24,576 = 128 heads x 192)",
-        "the second half of the factorised Q projection — the largest weight in the model at 151 MB",
+        None,
         ("q_lat", 128, 1536, NEUT),
         ("W_q_b", 1536, 24576, W_C),
         ("q_raw", 128, 24576, Q_C, (128, 128), "grid.x = 192 col tiles"),
