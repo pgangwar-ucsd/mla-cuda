@@ -173,18 +173,25 @@ step:
   192 blocks all read the same `q_lat`, which stays in L2, and take disjoint column
   panels of `W_q_b`, so the weight is fetched only once across the grid.
 
-## Step 2b — RoPE on the Rope Half
+## Step 2b — RoPE
 
 ![Step 2b](docs/step_2b.png)
 
 **Techniques Specific to This Step**
 
-- **Grid-stride loop capped at 32 × SM**, so the launch never scales with cache
-  depth.
-- **Absolute positions are a required argument** — in decode `Sq == 1` while the
-  query sits at position `Sk`, so it cannot be recovered from the shape.
-  `arange(Sq)` would place the query at position 0, where the rotation is the
-  identity.
+- **Slice happens in the addressing, not in the tensor.** The rope half is
+  columns `128:192` of each head's 192, so a thread reads `q_raw` directly at that
+  offset with stride 192 — nothing is sliced or copied first — and writes its
+  rotated pair into a *dense* `q_rope [B, Sq, H, 64]`.
+- **One thread per (row, head, adjacent pair), grid capped at `32 × SM`  blocks.**
+  The work is `bq × H × 32` pairs — `32 × SM` = 2,688 blocks is about five waves 
+  of residency — a 256-thread block caps at 6 per SM — enough that a straggler 
+  cannot idle the machine, while keeping block-dispatch cost amortized. 
+- **The lane index *is* the pair index, which is what coalesces both sides.** A
+  warp's 32 lanes share one `(bq, h)` and take that head's 32 pairs, so their
+  addresses form one 256 B window — and it is 256 B-*aligned* on the load
+  and on the store. No shared memory is involved at any point here,
+  so the bank-conflict rules from the GEMM recipe do not apply to this step. 
 
 ## Step 2c — Absorb `W_uk` into the Query
 
@@ -192,13 +199,15 @@ step:
 
 **Techniques Specific to This Step**
 
-- **One head per block** (`grid.z = h`), so `W_uk[h]` (262 KB) is staged into
-  shared memory once and amortized over the whole row tile instead of being
-  re-read for every `(row, head)` pair.
+- **One head per thread block** (`grid.z = h`). The step is `q_nope[:, h] @ W_uk[h]`. 
+  Each head's 128 non-rope query dims, columns `0:128` of its 192 in `q_raw`. 
+  `grid.y` cuts the 512 output ranks into 4 tiles of 128, so a block needs only the 
+  matching columns of the weight: `W_uk[h][:, r₀:r₀+128]`. It stages that once and 
+  reuses it for every `bq` row it owns — the `B·Sq` (batch, query-position) pairs.
 - **In-place slicing.** The nope half is read straight out of `q_raw` at stride
   192; no separate slice tensor is materialized.
 
-## Step 3a — Scores, then the Local Softmax Numerator
+## Step 3a — Scores and Local Softmax Numerator
 
 ![Step 3a](docs/step_3a.png)
 
@@ -209,8 +218,10 @@ step:
   boundary — no mid-kernel re-stage of aliased shared memory, no extra barrier
   pair, one row width throughout.
 - **Cache reuse across all 128 heads.** The block tile is 128 rows = exactly `H`,
-  so a block's rows are the 128 heads of one query and the cache tile it stages
-  serves all of them.
+  so a block's rows are the 128 heads of one query. The slab it stages is
+  `[128 keys × 32 dims]` per reduction step, `[128 keys × 576]` over the whole
+  block — 512 of those dims from `c_kv` and the last 64 from `pe_cache` — and every
+  one of the 128 heads reads it.
 - **Softmax exponentials moved *here*.** Step 3c stages each score once per rank
   tile — 4 times — so any per-score work there is done 4× over. 3a sees each score
   exactly once, in registers, so it exponentiates in the epilogue and gets the

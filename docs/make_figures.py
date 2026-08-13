@@ -49,6 +49,9 @@ OUT = os.path.dirname(os.path.abspath(__file__))
 MINT = 1.4          # minimum thickness, so a 1-row strip stays visible
 MAXH = 21.0         # height cap; past this the box is drawn with a break
 SMAX = 0.030        # cap on units-per-column, so small-dim figures stay sane
+TILEMIN = 0.45      # floor on a drawn tile, so a 1/192-wide one is still visible
+MINCELL = 0.80      # separators are drawn only if a cell is at least this wide/tall
+MAXCELLS = 16       # ...and only if there are few enough of them to count
 
 
 # --- primitives --------------------------------------------------------------
@@ -85,8 +88,13 @@ def box_size(rows, cols, s):
 
 
 def matrix(ax, x, ymid, rows, cols, s, color, name, alpha=0.16,
-           tiles=None, tile_lbl=None):
-    """Width is exactly proportional to `cols`; height too, until it hits MAXH."""
+           tiles=None, tile_lbl=None, syms=None):
+    """Width is exactly proportional to `cols`; height too, until it hits MAXH.
+
+    `tiles` = (cols_per_tile, rows_per_tile): dashed separators are drawn only when
+    there are few enough to read, but the highlighted corner tile always uses the
+    TRUE tile count, floored at TILEMIN so a 1/192 sliver stays visible.
+    `syms` = (row_symbol, col_symbol) for the dimension caption."""
     w, h, cut = box_size(rows, cols, s)
     y = ymid - h / 2
     rbox(ax, x, y, w, h, color, alpha=alpha)
@@ -95,16 +103,17 @@ def matrix(ax, x, ymid, rows, cols, s, color, name, alpha=0.16,
         tc, tr = tiles
         nx = max(int(round(cols / tc)), 1)
         ny = max(int(round(rows / tr)), 1)
-        if 1 < nx <= 24:
+        if 1 < nx <= MAXCELLS and w / nx >= MINCELL:
             for i in range(1, nx):
                 ax.plot([x + i * w / nx] * 2, [y, y + h], color=color, lw=0.8,
                         ls=(0, (2.5, 2)), zorder=5)
-        if 1 < ny <= 24:
+        if 1 < ny <= MAXCELLS and h / ny >= MINCELL:
             for j in range(1, ny):
                 ax.plot([x, x + w], [y + j * h / ny] * 2, color=color, lw=0.8,
                         ls=(0, (2.5, 2)), zorder=5)
-        rbox(ax, x, y + h - h / min(ny, 24), w / min(nx, 24), h / min(ny, 24),
-             color, alpha=0.5, lw=1.6, z=6, radius=0.2)
+        tw = max(w / nx, min(TILEMIN, w))
+        th = max(h / ny, min(TILEMIN, h))
+        rbox(ax, x, y + h - th, tw, th, color, alpha=0.5, lw=1.6, z=6, radius=0.2)
 
     if cut:   # rows truncated: break marks on both edges
         for xx in (x + w * 0.02, x + w * 0.98):
@@ -113,7 +122,9 @@ def matrix(ax, x, ymid, rows, cols, s, color, name, alpha=0.16,
 
     ax.text(x + w / 2, y + h + 1.5, name, ha="center", va="bottom", fontsize=8.8,
             fontweight="bold", color=INK)
-    ax.text(x + w / 2, y - 1.6, f"{rows:,}  x  {cols:,}", ha="center", va="top",
+    dim = (f"{syms[0]} ({rows:,})   x   {syms[1]} ({cols:,})" if syms
+           else f"{rows:,}  x  {cols:,}")
+    ax.text(x + w / 2, y - 1.6, dim, ha="center", va="top",
             fontsize=8.2, color=INK2)
     extra = None
     if cut:
@@ -156,8 +167,9 @@ def gemm_step(fname, width_in, tag, formula, note, A, B, C, footer, avail_w=88.0
         name, rows, cols, color = M[0], M[1], M[2], M[3]
         tiles = M[4] if len(M) > 4 else None
         tlbl = M[5] if len(M) > 5 else None
+        syms = M[6] if len(M) > 6 else None
         _, xr, _ = matrix(ax, x, ymid, rows, cols, s, color, name, tiles=tiles,
-                          tile_lbl=tlbl)
+                          tile_lbl=tlbl, syms=syms)
         if i < 2:
             op(ax, xr + 3.5, ymid, "@" if i == 0 else "=")
         x = xr + 7.0
@@ -348,9 +360,11 @@ def steps():
         "Step 2a1   —   project the hidden state into the q_lora latent",
         "q_lat  =  x @ W_q_a",
         "first half of the factorised Q projection.   7,168 = hidden.   1,536 = q_lora_rank.",
-        ("x", 128, 7168, Q_C),
-        ("W_q_a", 7168, 1536, W_C),
-        ("q_lat", 128, 1536, NEUT, (128, 128), "grid.x = 12 col tiles"),
+        ("x", 128, 7168, Q_C, None, None, ("B·Sq", "hidden")),
+        ("W_q_a", 7168, 1536, W_C, (128, 7168), "12 col panels -> grid.x",
+         ("hidden", "q_lora")),
+        ("q_lat", 128, 1536, NEUT, (128, 128), "grid.x = 12 col tiles",
+         ("B·Sq", "q_lora")),
         "grid.x -> 12 output-column tiles of 128   |   grid.y -> 1 row tile (bq = 128)   |   "
         "grid.z -> split-K: the 7,168 reduction is cut into slices\n"
         "Only 12 column tiles means 12 blocks on an 84-SM GPU — split-K is what makes this step use the machine at all."))
@@ -362,7 +376,8 @@ def steps():
                 "q_lat  :=  q_lat * rsqrt(mean(q_lat^2) + eps) * gain",
                 "row-wise; keeps the two matmuls from collapsing into one rank-1536 matrix")
     s = 60.0 / 1536
-    matrix(ax, 6, 11.0, 128, 1536, s, NEUT, "q_lat  (in and out)")
+    matrix(ax, 6, 11.0, 128, 1536, s, NEUT, "q_lat  (in and out)",
+           syms=("B·Sq", "q_lora"))
     ax.text(6 + 60 + 6, 11.0,
             "one CUDA block per row  ->  128 blocks\n"
             "256 threads cover 1,536 elements (6 each)\n"
@@ -379,9 +394,11 @@ def steps():
         "Step 2a2   —   expand the latent into the per-head query",
         "q_raw  =  q_lat @ W_q_b            (24,576 = 128 heads x 192)",
         None,
-        ("q_lat", 128, 1536, NEUT),
-        ("W_q_b", 1536, 24576, W_C),
-        ("q_raw", 128, 24576, Q_C, (128, 128), "grid.x = 192 col tiles"),
+        ("q_lat", 128, 1536, NEUT, None, None, ("B·Sq", "q_lora")),
+        ("W_q_b", 1536, 24576, W_C, (128, 1536), "192 col panels -> grid.x",
+         ("q_lora", "H·192")),
+        ("q_raw", 128, 24576, Q_C, (128, 128), "grid.x = 192 col tiles",
+         ("B·Sq", "H·192")),
         "grid.x -> 192 output-column tiles of 128   |   grid.y -> 1 row tile   |   grid.z -> split-K over the 1,536 reduction\n"
         "192 blocks against 84 SMs x 2 resident = 168 slots is 1.14 waves: one full wave, then a tail wave leaving 144 slots idle."))
 
@@ -407,8 +424,7 @@ def steps():
             "over all rows and heads:  [128 x 128 x 192]   ->   q_rope [128, 128, 64]",
             ha="center", va="top", fontsize=8.2, color=INK2)
     ax.text(3, 2.0,
-            "One thread per (row, head, adjacent pair), grid-stride capped at 32 x SM so the launch never scales with the cache depth. "
-            "0.1% of decode.",
+            "One thread per (row, head, adjacent pair), grid-stride capped at 32 x SM so the launch never scales with the cache depth.",
             fontsize=8.4, va="bottom", color=INK2)
     fig.savefig(os.path.join(OUT, "step_2b.png"), dpi=190, facecolor=SURFACE,
                 bbox_inches="tight", pad_inches=0.14)
@@ -420,23 +436,28 @@ def steps():
         "Step 2c   —   absorb W_uk into the query  (once per head)",
         "q_absorbed[:,h]  =  q_raw[:,h, 0:128] @ W_uk[h]        repeated for h = 0 .. 127",
         "this is the absorption: it widens the query 128 -> 512 so the cache can be read in its stored latent form",
-        ("q_nope[:,h]", 128, 128, Q_C),
-        ("W_uk[h]", 128, 512, W_C),
-        ("q_absorbed[:,h]", 128, 512, Q_C, (128, 128), "grid.y = 4 rank tiles"),
+        ("q_nope[:,h]", 128, 128, Q_C, None, None, ("B·Sq", "nope")),
+        ("W_uk[h]", 128, 512, W_C, (128, 128), "4 rank panels -> grid.y",
+         ("nope", "kv_rank")),
+        ("q_absorbed[:,h]", 128, 512, Q_C, (128, 128), "grid.y = 4 rank tiles",
+         ("B·Sq", "kv_rank")),
         "grid.x -> bq row tiles   |   grid.y -> 4 tiles of 128 over kv_rank=512   |   grid.z -> the head index, 0..127\n"
-        "One head per block means W_uk[h] (262 KB) is staged into shared memory once and reused by every row in the tile."))
+        "One head per block means W_uk[h] is staged into shared memory once and reused by every row in the tile."))
 
     # ---- 3a --------------------------------------------------------------
     figs.append(gemm_step(
         "step_3a", 11,
-        "Step 3a   —   scores, then the local softmax numerator",
+        "Step 3a   —   scores and local softmax numerator",
         "scores  =  ( q_absorbed . c_kv  +  q_rope . pe_cache ) / sqrt(192)        then store exp(s - m_j)",
-        "the two dot products (512 and 64 deep) are run as ONE 576-deep reduction; shown at Sk = 4,989",
-        ("query [576 wide]", 16384, 576, Q_C),
-        ("cache^T", 576, 4989, KV_C),
-        ("scores", 16384, 4989, KV_C, (128, 128), "128 x 128 per block"),
-        "grid.x -> flat = B.Sq.H / 128 = 128 tiles   |   grid.y -> Sk / 128 = 39 tiles   |   no grid.z (scores has a real Sk axis)\n"
-        "A block's 128 rows are the 128 heads of ONE query, so the cache tile it stages is reused by all 128 of them.",
+        "the two dot products (512 and 64 deep) are run as ONE 576-deep reduction",
+        ("q_absorbed | q_rope", 16384, 576, Q_C, (576, 128),
+         "128 row tiles -> grid.x", ("B·Sq·H", "kv_rank+rope")),
+        ("[ c_kv | pe_cache ]^T", 576, 4989, KV_C, (128, 576),
+         "39 key panels -> grid.y", ("kv_rank+rope", "Sk")),
+        ("scores", 16384, 4989, KV_C, (128, 128), "128 x 128 per block",
+         ("B·Sq·H", "Sk")),
+        "grid.x -> flat = B.Sq.H / 128 = 128 tiles   |   grid.y -> Sk / 128 = 39 tiles   |   no grid.z\n"
+        "A block's 128 rows are the 128 heads of ONE query, so the [128 keys x 576] slab it stages -- 512 dims from c_kv, then 64 from pe_cache -- is read by all 128 of them.",
         ))
 
     # ---- 3b --------------------------------------------------------------
@@ -448,13 +469,14 @@ def steps():
                 "3a's grid.y split each row across 39 blocks, none of which could see the global maximum")
     ymid = H - HEAD - PAD_T - MAXH / 2.0
     sb = 0.30
-    matrix(ax, 8, ymid, 16384, 39, sb, NEUT,
-           "m_part / l_part")
+    matrix(ax, 8, ymid, 16384, 39, sb, NEUT, "m_part / l_part",
+           syms=("B·Sq·H", "Sk/128"))
     xa = 8 + 39 * sb
     ax.add_patch(FancyArrowPatch((xa + 2.0, ymid), (xa + 8.0, ymid),
                                  arrowstyle="-|>", mutation_scale=8, lw=1.5,
                                  color=MUTED, shrinkA=0, shrinkB=0))
-    matrix(ax, xa + 10.0, ymid, 16384, 1, 2.2, KV_C, "row_sum")
+    matrix(ax, xa + 10.0, ymid, 16384, 1, 2.2, KV_C, "row_sum",
+           syms=("B·Sq·H", "1"))
     ax.text(xa + 17.0, ymid,
             "one CUDA block per row  ->  16,384 blocks\n"
             "256 threads stride the 39 partials of that row\n"
@@ -475,9 +497,12 @@ def steps():
         "Step 3c   —   context: the attention-weighted sum of the cache",
         "ctx  =  ( exp(s - m_j) * alpha_j ) @ c_kv        =  exp(s - M) @ c_kv,  unnormalised",
         "alpha_j is folded into the staging load, so what lands in shared memory is already the softmax numerator",
-        ("scores", 16384, 4989, KV_C),
-        ("c_kv", 4989, 512, KV_C),
-        ("ctx", 16384, 512, NEUT, (128, 128), "grid.y = 4 rank tiles"),
+        ("scores", 16384, 4989, KV_C, (4989, 128), "128 row tiles -> grid.x",
+         ("B·Sq·H", "Sk")),
+        ("c_kv", 4989, 512, KV_C, (128, 4989), "4 rank panels -> grid.y",
+         ("Sk", "kv_rank")),
+        ("ctx", 16384, 512, NEUT, (128, 128), "grid.y = 4 rank tiles",
+         ("B·Sq·H", "kv_rank")),
         "grid.x -> flat / 128 = 128 tiles   |   grid.y -> 4 tiles over kv_rank = 512   |   grid.z -> split-K over Sk\n"
         "ctx has no Sk axis, so at B=Sq=1 the output alone yields 4 blocks and ~95% of the SMs would idle — hence split-K here.",
         ))
@@ -488,9 +513,9 @@ def steps():
         "Step 3d   —   reconstruct V and project out  (once per head)",
         "out[:,h]  =  ( ctx[:,h] / row_sum ) @ W_uv[h]^T        repeated for h = 0 .. 127",
         "the deferred softmax divide rides along on a staging load this kernel was already doing",
-        ("ctx[:,h] / row_sum", 128, 512, NEUT),
-        ("W_uv[h]^T", 512, 128, W_C),
-        ("out[:,h]", 128, 128, Q_C, (128, 128), None),
+        ("ctx[:,h] / row_sum", 128, 512, NEUT, None, None, ("B·Sq", "kv_rank")),
+        ("W_uv[h]^T", 512, 128, W_C, None, None, ("kv_rank", "v_dim")),
+        ("out[:,h]", 128, 128, Q_C, (128, 128), None, ("B·Sq", "v_dim")),
         "grid.x -> bq row tiles   |   grid.y -> 1 tile over v_dim = 128   |   grid.z -> the head index, 0..127\n"
         "Narrows 512 -> 128, undoing the widening that step 2c did. One head per block, same reuse argument as 2c."))
 
