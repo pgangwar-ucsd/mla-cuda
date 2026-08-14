@@ -454,7 +454,8 @@ def steps():
          "128 row tiles -> grid.x", ("B·Sq·H", "kv_rank+rope")),
         ("[ c_kv | pe_cache ]^T", 576, 4989, KV_C, (128, 576),
          "39 key panels -> grid.y", ("kv_rank+rope", "Sk")),
-        ("scores", 16384, 4989, KV_C, (128, 128), "128 x 128 per block",
+        ("scores", 16384, 4989, KV_C, (128, 128),
+         "128 x 128 per block\nrow stride padded 4,989 -> 4,992 before storing,\nso every row starts on a 128 B line",
          ("B·Sq·H", "Sk")),
         "grid.x -> flat = B.Sq.H / 128 = 128 tiles   |   grid.y -> Sk / 128 = 39 tiles   |   no grid.z\n"
         "A block's 128 rows are the 128 heads of ONE query, so the [128 keys x 576] slab it stages -- 512 dims from c_kv, then 64 from pe_cache -- is read by all 128 of them.",
@@ -464,8 +465,8 @@ def steps():
     Hb = HEAD + PAD_T + MAXH + PAD_B + FOOT
     fig, ax = canvas(11, 11 * Hb / 100.0)
     H = Hb
-    step_header(ax, H, "Step 3b   —   reconcile the per-block softmax maxima",
-                "M = max_j m_j        alpha_j = exp(m_j - M)        row_sum = sum_j  l_j * alpha_j",
+    step_header(ax, H, "Step 3b   —  calculate the per-block softmax maxima",
+                "M = max(m_0 ... m_38)        alpha_j = exp(m_j - M)        row_sum = sum over j of  l_j * alpha_j",
                 "3a's grid.y split each row across 39 blocks, none of which could see the global maximum")
     ymid = H - HEAD - PAD_T - MAXH / 2.0
     sb = 0.30
@@ -478,14 +479,15 @@ def steps():
     matrix(ax, xa + 10.0, ymid, 16384, 1, 2.2, KV_C, "row_sum",
            syms=("B·Sq·H", "1"))
     ax.text(xa + 17.0, ymid,
-            "one CUDA block per row  ->  16,384 blocks\n"
-            "256 threads stride the 39 partials of that row\n"
-            "two block-wide reductions: max, then a weighted sum\n"
+            "one WARP per row:  256 threads / 32 = 8 warps = 8 rows per block,\n"
+            "so 16,384 rows / 8 = 2,048 blocks\n"
+            "its 32 lanes stride that row's 39 partials\n"
+            "two warp-shuffle reductions: max, then a weighted sum\n"
+            "no shared memory and no barrier -- it never leaves the warp\n"
             "also writes alpha [16,384 x 39], which step 3c consumes",
             va="center", fontsize=8.6, color=INK2)
     ax.text(3, 2.0,
-            "Exact because exp(s - m_j) * exp(m_j - M) = exp(s - M) termwise.  Total storage 7.7 MB against a 327 MB scores tensor; "
-            "costs 0.5% of decode.",
+            "exp(s - m_j) * exp(m_j - M) = exp(s - M)",
             fontsize=8.4, va="bottom", color=INK2)
     fig.savefig(os.path.join(OUT, "step_3b.png"), dpi=190, facecolor=SURFACE,
                 bbox_inches="tight", pad_inches=0.14)

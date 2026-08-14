@@ -221,37 +221,54 @@ step:
   so a block's rows are the 128 heads of one query. The slab it stages is
   `[128 keys × 32 dims]` per reduction step, `[128 keys × 576]` over the whole
   block — 512 of those dims from `c_kv` and the last 64 from `pe_cache` — and every
-  one of the 128 heads reads it.
-- **Softmax exponentials moved *here*.** Step 3c stages each score once per rank
-  tile — 4 times — so any per-score work there is done 4× over. 3a sees each score
-  exactly once, in registers, so it exponentiates in the epilogue and gets the
-  row sum for free.
-- **Per-block partials instead of atomics.** Emitting `(m_j, l_j)` for step 3b to
-  reconcile removes a float `atomicMax` (which CUDA has no native instruction
-  for) and ~39 atomics per row.
-- **Output row-stride padded to 128 B lines.** A row stride that is not a whole
-  cache line makes every row start at a different offset; padding took store
-  sectors per request from **5.75 → 4.00**.
-- **The merged reduction costs nothing at the staging loop.** Because both
-  operand pairs are contiguous in `r` and the rope/nope choice is uniform across
-  the block, the shared recipe's base-pointer folding resolves that two-way
-  source select *once per reduction tile* rather than per staged element. Both
-  of this kernel's staging loops also split by the same 32, so they share one
-  invariant column index and one hoisted predicate. 3a ends at 107 registers.
+  one of the 128 heads requires it.
+- **Softmax exponentials.** Each score is already sitting in a register here, so
+  3a exponentiates it on the way out and accumulates a partial sum. `grid.y` gives a
+  block only 128 of the `Sk` keys: 8 keys in a thread's own registers, then the 16
+  threads sharing that row combined by an `__shfl_xor` butterfly. That needs no
+  shared memory and no barrier because those 16 threads are half of one warp. The
+  tile is sized for it — `16 threads × 8 keys = 128 = kScoreSkTile`, so a row's
+  whole slice is warp-local. What block `j` ends up with is the pair `(m_j, l_j)`:
+  the largest score it saw, and `l_j = Σ exp(s − m_j)` over its 128 keys. The 39
+  such pairs per row are reconciled into the real denominator by 3b.
+- **Output row-stride padded to 128 B lines.** `scores` is `Sk` wide and `Sk` is a
+  runtime value: at 4,989 a row is 19,956 B, not a whole number of cache lines, so
+  each row begins at a different offset inside one and a warp's 64 B store run
+  straddles a sector boundary instead of filling two. Rounding the stride up to
+  4,992 floats — the next multiple of 32 — starts every row on a line. The 3 pad 
+  columns are never written or read.
+- **Switching operands mid-reduction is free.** Running one 576-deep loop means
+  the staging code has to pick its source at `r = 512` — `c_kv` before it,
+  `pe_cache` after — which could have meant a test per staged element. There is a
+  flag `rope = r0 >= kv_rank`, where `r0` is the reduction-tile counter walking
+  `0, 32, 64 … 544` through the 576 depth. Being a loop counter, it is identical
+  for every thread and constant for the whole tile — no branch per element and
+  no divergence. That same 32 is what both staging loops, q side and c_kv cache 
+  side, divide their index by, so the column index and its `< tile_len` predicate 
+  are computed once and serve both.
 
-## Step 3b — Reconcile the Per-Block Softmax Maxima
+## Step 3b — Calculate the Per-Block Softmax Maxima
 
 ![Step 3b](docs/step_3b.png)
 
 **Techniques Specific to This Step**
 
-- **The flash-softmax combine, done as a separate pass.** Exact because
-  `exp(s − m_j) · exp(m_j − M) = exp(s − M)` holds termwise for *any* `m_j`.
-- **The kernel boundary is the grid-wide barrier**, for free. This cannot be done
-  with atomics inside 3a: `(M, L)` is a *coupled* two-word update — `L`'s
-  correction depends on `M`'s new value — which would need a lock or a 128-bit CAS
-  under heavy contention.
-- **`alpha` does double duty**: it is the weight in this kernel's denominator sum
+- **The flash-softmax combine as a separate pass.** Softmax needs `exp(s − M)`
+  with `M` the maximum over all `Sk` keys of the row, but each 3a block saw only
+  its own 128 of them, so block `j` exponentiated against its *local* maximum `m_j`
+  and stored `exp(s − m_j)`. 3b reads the 39 maxima of a row, takes the largest of
+  them, `M = max(m_0 … m_38)`, and writes the correction `alpha_j = exp(m_j − M)`. 
+  One multiply then repairs any stored score, `exp(s − m_j) · exp(m_j − M) = exp(s − M)`. 
+  The same `alpha_j` reweights the partial sums into the real denominator: 
+  `row_sum = Σ l_j · alpha_j` over the 39 partials.
+- **The kernel boundary is the grid-wide barrier.** `M` is not knowable until all
+  39 of a row's blocks have reported, and blocks within one launch cannot wait for
+  each other — so ending 3a and starting 3b *is* that barrier. Atomics would not
+  substitute: `(M, row_sum)` is a **coupled** update, since raising `M` invalidates
+  every term already accumulated into `row_sum` — they all need rescaling by
+  `exp(M_old − M_new)` — so the pair has to move as one indivisible step, which
+  takes a lock rather than an atomic. 
+- **`alpha` does double duty**: Weight in this kernel's denominator sum
   *and* exactly the factor step 3c needs, so one array serves both.
 
 ## Step 3c — Context
@@ -289,14 +306,24 @@ step:
 
 ## What the Baseline Is
 
-`baseline_official_mla_attention` in
-[exhaustive_benchmark_suite.py](exhaustive_benchmark_suite.py) — the **same
-algorithm** in idiomatic PyTorch on cuBLAS, transcribed from DeepSeek-V3's
-official `inference/model.py` absorbed path: two GEMMs for the Q projection, a
-batched GEMM for the absorb, two einsums for scores, `torch.softmax`, then two
-more einsums for context and output.
+[`baseline_official_mla_attention`](exhaustive_benchmark_suite.py#L387) runs the
+**same nine steps** in idiomatic PyTorch on cuBLAS, transcribed from DeepSeek-V3's
+official `inference/model.py` absorbed path. Step for step:
 
-What makes it a fair comparison rather than a strawman:
+| step | what the baseline calls |
+|---|---|
+| 2a1, 2a-norm, 2a2 | `x @ W_q.a` → `rmsnorm` → `@ W_q.b` |
+| 2b | `apply_rope` on the `[..., 128:192]` slice |
+| 2c | `einsum("bsni,nir->bsnr")` — a batched GEMM, one per head |
+| 3a | `einsum("bqhr,bsr->bqhs")` + `einsum("bqhd,bsd->bqhs")`, summed and scaled |
+| 3b | no counterpart — `torch.softmax(dim=-1)` does the max, exp and divide in one |
+| 3c | `einsum("bqhs,bsr->bqhr")` |
+| 3d | `einsum("bqhr,hdr->bqhd")` |
+
+Every intermediate is materialized on both sides, including the `[B, Sq, H, Sk]`
+score matrix, so neither implementation is getting a fusion the other cannot.
+
+What makes it a fair comparison:
 
 - **Identical mathematics and shapes.** Both sides consume the same factorized
   `W_q_a / q_norm_w / W_q_b`, the same `wkv_b`, the same absolute positions.
@@ -305,7 +332,6 @@ What makes it a fair comparison rather than a strawman:
   cores.
 - **Both timed end to end**, Q-prep through output projection — the fused number
   includes all nine launches plus two `.contiguous()` copies.
-- **It is the real production path**, not a naive loop.
 
 Method: FP32, RTX A6000, idle GPU, `torch.cuda.Event` timing, 10 warm-up
 iterations, **L2 flushed with a 256 MB buffer between every timed iteration** so
@@ -356,19 +382,7 @@ taken.
 | **TOTAL** | **125.36** | 100% |
 
 **3a + 3c are 85% of decode.** Both are limited by shared-memory bandwidth, not
-by occupancy or instruction scheduling: at 0.25 loads/FMA the 8×8 register tile
-asks for 32 shared-memory words per clock against the 32 that sm_86 can deliver,
-so the reduction strip has no headroom to schedule into. Measured against that
-model — unrolling the strip by 2, 4 or 8 compiles without spilling and drops 3a
-from 127 to 110 registers, yet moves the benchmark by less than 1%, because
-extra ILP has nothing to hide behind. What *did* move it was removing issued
-work from the staging loops (see the GEMM recipe): measured as a matched
-before/after pair on one GPU in one session, that is 0.77× → 0.83× geometric
-mean, −7.3% fused time averaged over the ten scenarios and faster on every one
-of them. Applied to 3a and 3c first (−5.7%), then 2a1/2a2 and 2c (−1.3%), then
-3d (−0.5%) — the gains track each step's share of the total, and land hardest on
-the shapes where a narrow `bq` tile leaves the reduction strip with the least
-work to hide the staging behind.
+by occupancy or instruction scheduling. 
 
 ---
 
