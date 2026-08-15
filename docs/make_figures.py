@@ -78,24 +78,29 @@ def step_header(ax, H, tag, formula, note=None):
         ax.text(3, H - 13.6, note, fontsize=8.6, va="top", color=INK2)
 
 
-def box_size(rows, cols, s):
+def box_size(rows, cols, s, wcap=None):
     """Rows and columns share one scale, so a contracted dimension is drawn the same
-    length on both operands -- q_lat's 1,536 columns match W_q_b's 1,536 rows. Only a
-    box past MAXH breaks that, and it is labelled truncated when it does."""
-    w = cols * s
-    raw = rows * s
-    return w, min(max(raw, MINT), MAXH), raw > MAXH
+    length on both operands -- q_lat's 1,536 columns match W_q_b's 1,536 rows.
+
+    With `wcap` the width is capped too, at the same value as the height, so the
+    symmetry survives even for the huge dimensions: Sk = 4,989 is truncated to the
+    same extent whether it appears as scores' columns or c_kv's rows. Truncation on
+    either axis is drawn with break marks and labelled."""
+    raw_w, raw_h = cols * s, rows * s
+    w = min(max(raw_w, MINT), wcap) if wcap else max(raw_w, MINT)
+    h = min(max(raw_h, MINT), MAXH)
+    return w, h, raw_h > MAXH, bool(wcap) and raw_w > wcap
 
 
 def matrix(ax, x, ymid, rows, cols, s, color, name, alpha=0.16,
-           tiles=None, tile_lbl=None, syms=None):
+           tiles=None, tile_lbl=None, syms=None, wcap=None):
     """Width is exactly proportional to `cols`; height too, until it hits MAXH.
 
     `tiles` = (cols_per_tile, rows_per_tile): dashed separators are drawn only when
     there are few enough to read, but the highlighted corner tile always uses the
     TRUE tile count, floored at TILEMIN so a 1/192 sliver stays visible.
     `syms` = (row_symbol, col_symbol) for the dimension caption."""
-    w, h, cut = box_size(rows, cols, s)
+    w, h, cut, cutw = box_size(rows, cols, s, wcap)
     y = ymid - h / 2
     rbox(ax, x, y, w, h, color, alpha=alpha)
 
@@ -115,9 +120,13 @@ def matrix(ax, x, ymid, rows, cols, s, color, name, alpha=0.16,
         th = max(h / ny, min(TILEMIN, h))
         rbox(ax, x, y + h - th, tw, th, color, alpha=0.5, lw=1.6, z=6, radius=0.2)
 
-    if cut:   # rows truncated: break marks on both edges
+    if cut:   # rows truncated: break marks on the left and right edges
         for xx in (x + w * 0.02, x + w * 0.98):
             ax.text(xx, ymid, "⋮", ha="center", va="center", fontsize=11,
+                    color=color, zorder=8)
+    if cutw:  # columns truncated: break marks on the top and bottom edges
+        for yy in (y + h * 0.04, y + h * 0.96):
+            ax.text(x + w / 2, yy, "⋯", ha="center", va="center", fontsize=11,
                     color=color, zorder=8)
 
     ax.text(x + w / 2, y + h + 1.5, name, ha="center", va="bottom", fontsize=8.8,
@@ -127,8 +136,12 @@ def matrix(ax, x, ymid, rows, cols, s, color, name, alpha=0.16,
     ax.text(x + w / 2, y - 1.6, dim, ha="center", va="top",
             fontsize=8.2, color=INK2)
     extra = None
-    if cut:
+    if cut and cutw:
+        extra = "(rows and columns truncated to fit)"
+    elif cut:
         extra = "(rows truncated to fit)"
+    elif cutw:
+        extra = "(columns truncated to fit)"
     elif h == MINT and rows * s < MINT:
         extra = f"({rows} rows: a thin strip)"
     if extra:
@@ -147,33 +160,50 @@ def op(ax, x, ymid, sym):
 HEAD, PAD_T, PAD_B, FOOT = 19.0, 5.0, 10.5, 6.0
 
 
-def gemm_step(fname, width_in, tag, formula, note, A, B, C, footer, avail_w=88.0):
+def gemm_step(fname, width_in, tag, formula, note, A, B, C, footer, avail_w=88.0,
+              shapes=None):
     """A @ B = C with proportional boxes. A=(name,M,K,color), B=(name,K,N,color),
     C=(name,M,N,color[,tiles,tile_lbl]). The canvas height follows the tallest box,
     so nothing can collide with the header."""
     tot_cols = A[2] + B[2] + C[2]
     gaps = 2 * 7.0                     # two operator gaps
     s = min((avail_w - gaps) / tot_cols, SMAX)
-    maxh = max(box_size(M[1], M[2], s)[1] for M in (A, B, C))
+    boxes = [box_size(M[1], M[2], s, MAXH) for M in (A, B, C)]
+    maxh = max(b[1] for b in boxes)
 
-    H = (HEAD if note else HEAD - 5.0) + PAD_T + maxh + PAD_B + FOOT
+    # A box can be far narrower than the caption beneath it (c_kv is 512 wide against
+    # a 30-character label), so each matrix gets a SLOT as wide as the greater of the
+    # two and is centred in it. Laying out by box width alone collides the captions.
+    def cap_units(M):
+        syms = M[6] if len(M) > 6 else None
+        txt = (f"{syms[0]} ({M[1]:,})   x   {syms[1]} ({M[2]:,})" if syms
+               else f"{M[1]:,}  x  {M[2]:,}")
+        return len(txt) * 8.2 * 0.62 / 72.0 / width_in * 100.0
+
+    slots = [max(boxes[i][0], cap_units(M)) for i, M in enumerate((A, B, C))]
+
+    head = HEAD if note else HEAD - 5.0
+    H = head + PAD_T + maxh + PAD_B + FOOT
     fig, ax = canvas(width_in, width_in * H / 100.0)
     step_header(ax, H, tag, formula, note)
-    ymid = H - HEAD - PAD_T - maxh / 2.0
+    ymid = H - head - PAD_T - maxh / 2.0
 
-    group_w = tot_cols * s + gaps
-    x = max(5.0, (100.0 - group_w) / 2.0)
+    group_w = sum(slots) + gaps
+    x = max(3.0, (100.0 - group_w) / 2.0)
     for i, M in enumerate((A, B, C)):
         name, rows, cols, color = M[0], M[1], M[2], M[3]
         tiles = M[4] if len(M) > 4 else None
         tlbl = M[5] if len(M) > 5 else None
         syms = M[6] if len(M) > 6 else None
-        _, xr, _ = matrix(ax, x, ymid, rows, cols, s, color, name, tiles=tiles,
-                          tile_lbl=tlbl, syms=syms)
+        matrix(ax, x + (slots[i] - boxes[i][0]) / 2.0, ymid, rows, cols, s, color,
+               name, tiles=tiles, tile_lbl=tlbl, syms=syms, wcap=MAXH)
         if i < 2:
-            op(ax, xr + 3.5, ymid, "@" if i == 0 else "=")
-        x = xr + 7.0
+            op(ax, x + slots[i] + 3.5, ymid, "@" if i == 0 else "=")
+        x += slots[i] + 7.0
 
+    if shapes:   # sits under the boxes, so the symbols resolve where they are read
+        ax.text(max(3.0, (100.0 - group_w) / 2.0) + group_w / 2.0, 6.4, shapes,
+                ha="center", va="bottom", fontsize=8.0, color=MUTED, style="italic")
     ax.text(3, 2.0, footer, fontsize=8.4, va="bottom", color=INK2)
     fig.savefig(os.path.join(OUT, fname + ".png"), dpi=190, facecolor=SURFACE,
                 bbox_inches="tight", pad_inches=0.14)
@@ -457,18 +487,32 @@ def steps():
         ("scores", 16384, 4989, KV_C, (128, 128),
          "128 x 128 per block\nrow stride padded 4,989 -> 4,992 before storing,\nso every row starts on a 128 B line",
          ("B·Sq·H", "Sk")),
-        "grid.x -> flat = B.Sq.H / 128 = 128 tiles   |   grid.y -> Sk / 128 = 39 tiles   |   no grid.z\n"
+        shapes="batch-128 decode:  B·Sq = 128 rows (128 sequences, one query each),  H = 128 heads,  "
+               "so B·Sq·H = 16,384;  Sk = 4,989",
+        footer="grid.x -> flat = B.Sq.H / 128 = 128 tiles   |   grid.y -> Sk / 128 = 39 tiles   |   no grid.z\n"
         "A block's 128 rows are the 128 heads of ONE query, so the [128 keys x 576] slab it stages -- 512 dims from c_kv, then 64 from pe_cache -- is read by all 128 of them.",
         ))
 
     # ---- 3b --------------------------------------------------------------
-    Hb = HEAD + PAD_T + MAXH + PAD_B + FOOT
+    Hb = HEAD + 7.0 + PAD_T + MAXH + PAD_B + FOOT
     fig, ax = canvas(11, 11 * Hb / 100.0)
     H = Hb
-    step_header(ax, H, "Step 3b   —  calculate the per-block softmax maxima",
-                "M = max(m_0 ... m_38)        alpha_j = exp(m_j - M)        row_sum = sum over j of  l_j * alpha_j",
-                "3a's grid.y split each row across 39 blocks, none of which could see the global maximum")
-    ymid = H - HEAD - PAD_T - MAXH / 2.0
+    ax.text(3, H - 3.6, "Step 3b   —  reconcile the per-block softmax maxima",
+            fontsize=13, fontweight="bold", va="top", color=INK)
+    # The inputs are named BEFORE the equations that consume them.
+    ax.text(3, H - 9.0,
+            "3a split each row across 39 blocks. Block j reported two numbers:  "
+            "m_j, the largest score it saw,  and  l_j = Σ exp(s - m_j) over its 128 keys.",
+            fontsize=8.8, va="top", color=INK2)
+    ax.text(3, H - 15.0,
+            "M = max(m_0 ... m_38)     alpha_j = exp(m_j - M)     "
+            "row_sum = Σ l_j · alpha_j   for j = 0 .. 38",
+            fontsize=10.5, va="top", color=INK)
+    ax.text(3, H - 20.5,
+            "row_sum is that row's softmax denominator — Σ exp(s - M) over all Sk keys — "
+            "which step 3d divides the context by.",
+            fontsize=8.6, va="top", color=INK2)
+    ymid = H - HEAD - 7.0 - PAD_T - MAXH / 2.0
     sb = 0.30
     matrix(ax, 8, ymid, 16384, 39, sb, NEUT, "m_part / l_part",
            syms=("B·Sq·H", "Sk/128"))
@@ -498,7 +542,8 @@ def steps():
         "step_3c", 11,
         "Step 3c   —   context: the attention-weighted sum of the cache",
         "ctx  =  ( exp(s - m_j) * alpha_j ) @ c_kv        =  exp(s - M) @ c_kv,  unnormalised",
-        "alpha_j is folded into the staging load, so what lands in shared memory is already the softmax numerator",
+        "j is an Sk-TILE index, j = k / 128,\n"
+        "alpha is indexed [row, j] and is [16,384 x 39].",
         ("scores", 16384, 4989, KV_C, (4989, 128), "128 row tiles -> grid.x",
          ("B·Sq·H", "Sk")),
         ("c_kv", 4989, 512, KV_C, (128, 4989), "4 rank panels -> grid.y",
@@ -507,19 +552,25 @@ def steps():
          ("B·Sq·H", "kv_rank")),
         "grid.x -> flat / 128 = 128 tiles   |   grid.y -> 4 tiles over kv_rank = 512   |   grid.z -> split-K over Sk\n"
         "ctx has no Sk axis, so at B=Sq=1 the output alone yields 4 blocks and ~95% of the SMs would idle — hence split-K here.",
+        shapes="batch-128 decode:  B·Sq = 128 rows (128 sequences, one query each),  H = 128 heads,  "
+               "so B·Sq·H = 16,384;  Sk = 4,989",
         ))
 
     # ---- 3d --------------------------------------------------------------
     figs.append(gemm_step(
         "step_3d", 11,
         "Step 3d   —   reconstruct V and project out  (once per head)",
-        "out[:,h]  =  ( ctx[:,h] / row_sum ) @ W_uv[h]^T        repeated for h = 0 .. 127",
-        "the deferred softmax divide rides along on a staging load this kernel was already doing",
-        ("ctx[:,h] / row_sum", 128, 512, NEUT, None, None, ("B·Sq", "kv_rank")),
-        ("W_uv[h]^T", 512, 128, W_C, None, None, ("kv_rank", "v_dim")),
-        ("out[:,h]", 128, 128, Q_C, (128, 128), None, ("B·Sq", "v_dim")),
-        "grid.x -> bq row tiles   |   grid.y -> 1 tile over v_dim = 128   |   grid.z -> the head index, 0..127\n"
-        "Narrows 512 -> 128, undoing the widening that step 2c did. One head per block, same reuse argument as 2c."))
+        "out  =  ( ctx / row_sum ) @ W_uv[h]^T          h = the head of that row",
+        "A row's head index picks which of the 128 W_uv panels it multiplies\n"
+        "grid.z hands each block one panel and the 128 rows that want it.",
+        ("ctx / row_sum", 16384, 512, NEUT, (512, 128), "128 head panels -> grid.z",
+         ("B·Sq·H", "kv_rank")),
+        ("W_uv[h]^T   (1 of 128)", 512, 128, W_C, None, None, ("kv_rank", "v_dim")),
+        ("out", 16384, 128, Q_C, (128, 128), "128 head panels -> grid.z",
+         ("B·Sq·H", "v_dim")),
+        "grid.x -> bq row tiles   |   grid.y -> 1 tile over v_dim = 128   |   grid.z -> the head index, 0..127",
+        shapes="batch-128 decode:  B·Sq = 128 rows (128 sequences, one query each),  H = 128 heads,  "
+               "so B·Sq·H = 16,384"))
 
     return figs
 
