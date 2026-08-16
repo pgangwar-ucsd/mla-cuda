@@ -153,6 +153,27 @@ def matrix(ax, x, ymid, rows, cols, s, color, name, alpha=0.16,
     return x, x + w, h
 
 
+def caption_depth(rows, cols, s, wcap, tile_lbl, width_in):
+    """How far below a box's bottom edge its caption stack reaches, in canvas units.
+
+    matrix() stacks up to three things under a box -- the dimension caption, the
+    truncation note, and the tile label -- and the tile label can be several lines.
+    A fixed PAD_B is therefore not enough space in general: it is what let 3a's
+    three-line `scores` label run into the shapes line. Mirrors the offsets and
+    font sizes used in matrix(); keep the two in step."""
+    unit_pt = width_in * 72.0 / 100.0          # canvas units -> points
+    line = lambda fs: fs * 1.35 / unit_pt
+    w, h, cut, cutw = box_size(rows, cols, s, wcap)
+    extra = cut or cutw or (h == MINT and rows * s < MINT)
+    d = 1.6 + line(8.2)                        # dimension caption
+    if extra:
+        d = max(d, 4.3 + line(7.2))            # "(rows truncated to fit)"
+    if tile_lbl:
+        d = max(d, (7.0 if extra else 4.3)
+                   + (tile_lbl.count("\n") + 1) * line(7.4))
+    return d
+
+
 def op(ax, x, ymid, sym):
     ax.text(x, ymid, sym, ha="center", va="center", fontsize=15, color=INK2)
 
@@ -182,8 +203,18 @@ def gemm_step(fname, width_in, tag, formula, note, A, B, C, footer, avail_w=88.0
 
     slots = [max(boxes[i][0], cap_units(M)) for i, M in enumerate((A, B, C))]
 
+    # Grow the bottom padding until the deepest caption stack clears whatever is
+    # written below it. A short box sits centred at ymid, so its caption starts
+    # (maxh - h)/2 higher up and needs correspondingly less room.
+    floor_y = 8.8 if shapes else 5.9           # top of the shapes line / the footer
+    slack = min(FOOT + (maxh - boxes[i][1]) / 2.0
+                - caption_depth(M[1], M[2], s, MAXH,
+                                M[5] if len(M) > 5 else None, width_in)
+                for i, M in enumerate((A, B, C)))
+    pad_b = max(PAD_B, floor_y - slack)
+
     head = HEAD if note else HEAD - 5.0
-    H = head + PAD_T + maxh + PAD_B + FOOT
+    H = head + PAD_T + maxh + pad_b + FOOT
     fig, ax = canvas(width_in, width_in * H / 100.0)
     step_header(ax, H, tag, formula, note)
     ymid = H - head - PAD_T - maxh / 2.0
