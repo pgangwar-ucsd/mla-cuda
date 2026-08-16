@@ -18,7 +18,7 @@ baseline**. See [Benchmarks](#3-benchmarks).
 1. [Why MLA?](#1-why-mla)
 2. [Algorithm](#2-algorithm)
 3. [Benchmarks](#3-benchmarks)
-4. [Diagnosing Each Optimization](#4-diagnosing-each-optimization-in-nsight-compute)
+4. [Profiling Different Stages](#4-profiling-different-stages-with-nsight-compute)
 5. [Build and Run](#5-build-and-run)
 
 ---
@@ -77,7 +77,7 @@ step:
   the *entire* reduction, every such value is one the scheduler cannot spend on 
   prefetching the next operand. Measured at **4,473× fewer** shared-load bank
   conflicts than an unpadded stride and 3.45× off the kernel, though not to zero —
-  663,937 remain. See [4.1](#41-shared-memory-bank-conflicts--pad-the-row-stride).
+  663,937 remain. See [4.6](#46-shared-memory-bank-conflicts--pad-the-row-stride).
 - **64x ILP per thread** - `16×16 = 256` threads per block, **8×8 
   outputs per thread**, resulting in `128×128 output tile per thread block`. An M×N register tile costs M+N shared-memory loads per M·N FMAs, 
   so 8×8 gives 0.25 loads/FMA — sm_86 issues 128 FP32 lanes per SM against 32 shared-memory
@@ -88,13 +88,15 @@ step:
   `65,536 / 512 = 128 registers`, so all kernels fit without spilling. Asking for 3
   resident blocks instead caps them at 85 and spills 138 M local ld/st — for *no*
   occupancy gain, since shared memory already limits residency to 2. See
-  [4.3](#43-register-spilling--do-not-over-request-residency).
+  [4.4](#44-register-spilling--do-not-over-request-residency).
 - **Split-K when the output cannot fill the GPU** - A 128×128 output tile
   means a small output yields few blocks: 2a1's 1536 columns are 12 tiles, and the
   `bq` dimension collapses to a single tile for any `bq_total ≤ 128` — most of
   decode — so the launch would occupy 12 of 84 SMs. Split-K adds a grid dimension
   over the *reduction* instead: each slice takes a disjoint span of it, accumulates
-  its own partial, and `atomicAdd`s into a pre-zeroed output.
+  its own partial, and `atomicAdd`s into a pre-zeroed output. Worth **7.6×** on
+  2a1 at `bq = 1`, where it takes the grid from 12 blocks to 1,344. See
+  [4.1](#41-wave-quantization--split-the-reduction).
 - **Tiling of contracted dimension** - A block's 128×128 output
   tile is a dot product over 32-deep chunks: all 256 threads cooperatively stage a 
   `[128 × 32]` slab of each operand into shared memory, barrier, reduce that slab into 
@@ -124,7 +126,9 @@ step:
 - **Adaptive `bq` tile** - Kernels with row axis `bq` pick their tile height at
   launch. The thread block is always 16×16 threads and `threadIdx.y` walks rows, so 
   if each of those 16 columns owns `kBqReg` rows the tile is `16 × kBqReg` = 16, 32, 
-  64 or 128 rows, and a thread's accumulator block is `kBqReg × 8`. A single-stream decode has exactly one real row, so a 128-row tile would do 128 rows of work to keep 1. `bq_reg_for()` therefore picks the **smallest tile that still covers `bq_total`**: 16 at `bq = 1` (the floor, since `blockDim.y = 16`), 32 at `bq = 20`, etc., freeing up registers to increase occupancy.
+  64 or 128 rows, and a thread's accumulator block is `kBqReg × 8`. A single-stream decode has exactly one real row, so a 128-row tile would do 128 rows of work to keep 1. `bq_reg_for()` therefore picks the **smallest tile that still covers `bq_total`**: 16 at `bq = 1` (the floor, since `blockDim.y = 16`), 32 at `bq = 20`, etc., freeing up registers to increase occupancy. Pinning the tile at 128 costs 8× the FFMA
+  instructions and 125 registers a thread against 79. See
+  [4.2](#42-work-thrown-away--size-the-tile-to-the-problem).
 
 ---
 
@@ -245,7 +249,7 @@ step:
   columns are never written or read. The metric that shows the cost is **main-memory
   traffic**, and it is 3c — which reads `scores` back — that pays it: unpadded, 3c's
   DRAM traffic rises 2.69 → 3.00 GB, **+329 MB per decode step**. See
-  [4.8](#48-the-scores-row-stride--profile-the-consumer-not-the-producer).
+  [4.7](#47-the-scores-row-stride--profile-the-consumer-not-the-producer).
 - **Switching operands mid-reduction is free.** Running one 576-deep loop means
   the staging code has to pick its source at `r = 512` — `c_kv` before it,
   `pe_cache` after — which could have meant a test per staged element. There is a
@@ -401,112 +405,133 @@ by occupancy or instruction scheduling.
 
 ---
 
-# 4. Diagnosing Each Optimization in Nsight Compute
+# 4. Profiling Different Stages with Nsight Compute
 
-This section answers a different question from the benchmark table: **if the
-optimization were not there, what would the profiler have shown you, and how would
-you know what to do about it?** Each subsection names the symptom, the section of
-the Nsight report it appears in, and the fix it implies.
-
-Every claim is a real A/B: the optimization is removed from the source, the
-extension is rebuilt, and the same kernel is re-profiled with `ncu --set full`.
+Each subsection names a **deliberately broken build**, the symptom it produces, the
+section of the Nsight report the symptom appears in, and the fix it implies. Every
+build is re-profiled with `ncu --set full` against the shipped kernel.
 Nsight Compute 2023.2.2, RTX A6000 (`sm_86`), FP32, TF32 off.
 
-## Opening the reports
-
-`profiles/` holds one full report per build. Open the un-optimized one and load the
-shipped one as a baseline — the GUI then shows both in every section with deltas:
-
-```bash
-ncu-ui profiles/WITHOUT_nopad.ncu-rep
-#   File > Add Baseline...  ->  profiles/WITH_scores_ctx_avgctx.ncu-rep
-```
-
-| report | build | kernels | scenario |
+| build | what it changes | kernels | scenario |
 |---|---|---|---|
-| `WITH_scores_ctx_avgctx` | shipped | 3a, 3c | `decode_serving_avg_ctx` |
-| `WITH_qgemm_bq1` | shipped | 2a1/2a2 | `decode_single_user_long_ctx` |
-| `WITHOUT_nopad` | no `+1` shared padding | 3a, 3c | `decode_serving_avg_ctx` |
-| `WITHOUT_tile4` | 4×4 register tile | 3a, 3c | `decode_serving_avg_ctx` |
-| `WITHOUT_blocks3` | `__launch_bounds__(256, 3)` | 3a, 3c | `decode_serving_avg_ctx` |
-| `WITHOUT_red64` / `_red16` | 64- / 16-deep reduction tile | 3a, 3c | `decode_serving_avg_ctx` |
-| `WITHOUT_noalign` | `scores` stride unpadded | 3a, 3c | `decode_serving_avg_ctx` |
-| `WITHOUT_prestaging` | staging loops before strength-reduction | 3a, 3c | `decode_serving_avg_ctx` |
-| `WITHOUT_nosplit` | split-K disabled | 2a1/2a2 | `decode_single_user_long_ctx` |
-| `WITHOUT_fixedbq` | `bq` tile pinned to 128 rows | 2a1/2a2 | `decode_single_user_long_ctx` |
+| **No split-K** | the reduction is not sliced across `grid.z` | 2a1, 2a2 | `decode_single_user_long_ctx` |
+| **Fixed `bq` tile** | the `bq` tile is pinned at 128 rows | 2a1, 2a2 | `decode_single_user_long_ctx` |
+| **Narrow register tile** | 4×4 outputs per thread instead of 8×8 | 3a, 3c | `decode_serving_avg_ctx` |
+| **Over-requested residency** | `__launch_bounds__(256, 3)` instead of `(256, 2)` | 3a, 3c | `decode_serving_avg_ctx` |
+| **Deep / shallow reduction tile** | 64- or 16-deep instead of 32 | 3a, 3c | `decode_serving_avg_ctx` |
+| **Unpadded shared stride** | no `+1` on the shared row stride | 3a, 3c | `decode_serving_avg_ctx` |
+| **Unpadded `scores` stride** | row stride left at `Sk` instead of rounded to 32 | 3a, 3c | `decode_serving_avg_ctx` |
+| **Plain staging loops** | staging loops before strength-reduction | 3a, 3c | `decode_serving_avg_ctx` |
+| **Shipped** | — | all | both |
 
-## The symptom table
+## 4.1 Wave quantization → split the reduction
 
-Each optimization leaves a distinct fingerprint. Read across: the *combination* is
-what identifies the cause, because duration alone never does.
+**Build:** No split-K · **Kernels changed:** 2a1 and 2a2, which share
+`q_raw_gemm_kernel` and get a `grid.z` slice count each from
+`plan_q_gemm_split()`; 3c splits separately, over `Sk` · **GUI:** Launch
+Statistics → *Waves Per SM*, then Occupancy.
 
-| what you see | DRAM traffic | shared traffic | occupancy | other | diagnosis |
-|---|---|---|---|---|---|
-| every kernel 2.5–3.9× slow | flat | **9× wavefronts** | flat | — | shared-memory bank conflicts |
-| 1.5–1.7× slow | **+47–55%** | 2× wavefronts | *doubled* | — | block tile too small: operands re-staged |
-| 1.5–1.7× slow | +3–29% | flat | flat | **138 M local ld/st** | register spilling |
-| 1.2–1.4× slow | flat | flat | **halved** | — | shared memory capping residency |
-| 1.05–1.08× slow | flat | flat | flat | 0 conflicts, more barriers | reduction tile too shallow |
-| no wall-clock change | **+11.6% in the consumer** | flat | flat | sectors/req 3.00→3.29 | unaligned row stride |
-| 1.07–1.14× slow, uniform | flat | flat | flat | **+38% integer inst** | address math stealing issue slots |
-| 7.6× slow | flat | flat | 46%→17% | **waves/SM 0.05** | wave quantization |
-| 1.7× slow | flat | flat | 46%→32% | **8× FFMA** | tile larger than the problem |
+At `bq = 1`, 2a1's output is `[1 × 1536]` — one `bq` tile by 12 column tiles, so
+the entire grid is **12 blocks on an 84-SM GPU**.
 
-## Step 0 — always read Speed of Light first
+![No split-K](docs/Without_K-Split.png)
 
-Before any specific counter, the SOL section says which class of fix can help at
-all. For 3a in the shipped build:
+Reading it:
 
-```
-    sm__throughput.avg.pct_of_peak_sustained_elapsed                     %      82.75
-    gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed               %      52.68
-    l1tex__data_pipe_lsu_wavefronts_mem_shared.avg.pct_of_peak...        %      39.12
-    smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active  inst     1.44
-    smsp__average_warps_issue_stalled_mio_throttle_per_issue_active     inst     0.76
-    smsp__average_warps_issue_stalled_barrier_per_issue_active          inst     0.42
-    smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active inst     0.11
-```
+- **Grid Size 12** against 84 SMs — 72 of them never receive a block at all, which
+  is the 85.71% Nsight's own *Small Grid* rule estimates.
+- **Waves Per SM 0.05** = blocks / (SMs × blocks resident per SM) = 12 / (84 × 3).
+  Below one wave there is no steady state; the tail *is* the kernel.
+- **Achieved Occupancy 16.66%** against a theoretical 50%. The theoretical figure
+  is 24 of the SM's 48 warp slots — the 3 blocks that 79 registers/thread and
+  19.01 KB of shared memory both permit. But *Achieved Active Warps Per SM* is
+  **8.00**, exactly one block: even the 12 SMs that got work got one block each,
+  with nothing to interleave against it.
 
-Compute-side throughput (82.8%) sits well above DRAM (52.7%), so 3a is **not** a
-pure bandwidth problem and "move fewer bytes" cannot be the whole answer. Then
-**Warp State Statistics** names the mechanism: `long_scoreboard` (global-memory
-latency) dominates and `short_scoreboard` (shared-memory dependency) is near zero
-— the latter being the padding already working. In the GUI these are the *Warp
-State* bar chart and the *GPU Speed Of Light Throughput* roofline/bar pair.
+Note where the *Occupancy Limiters* rule points — registers and shared memory. It
+is right about the theoretical 50% ceiling and irrelevant to the time: the gap from
+50% down to 16.66% is grid size, and 12 blocks cannot fill 84 SMs however many
+would have fit on each. This is a Launch Statistics diagnosis; no memory or
+instruction counter points at it.
 
-## 4.1 Shared-memory bank conflicts → pad the row stride
+**Fix.** Slice the 7,168-deep reduction across `grid.z`. It is 224 tiles of 32, and
+`plan_q_gemm_split()` targets `kQSplitTargetWaves = 8` waves, landing on **112
+slices** — so the grid becomes 12 × 112 = 1,344 blocks over the same output.
 
-**Report:** `WITHOUT_nopad` · **GUI:** Memory Workload Analysis → *Shared Memory*
-table, and the Warp State chart.
+![Shipped: split-K and the adaptive `bq` tile](docs/With_K-Split_and_Flexible_BQ.png)
 
-Without padding, the row stride is a multiple of 32 floats, so column `r` of every
-row lands in the same bank and the strip's 8 column loads serialize.
+| | No split-K | Shipped |
+|---|--:|--:|
+| Grid size | 12 | 1,344 |
+| Waves Per SM | 0.05 | 5.33 |
+| Achieved occupancy | 16.66% | 46.30% |
+| **duration** | **1.03 ms** | **0.13 ms** |
 
-```
-                                                    WITHOUT_nopad      WITH
-    gpu__time_duration.sum                msecond          29.60       8.58
-    l1tex__data_bank_conflicts_..._op_ld.sum        2,944,680,278    663,937
-    l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld  3,313,000,000  368,713,732
-```
+**7.6×.** Waves per SM lands at 5.33 rather than the 8 requested because the plan
+sizes the split against `kTileBlocksPerSM = 2` while this launch actually fits 3 —
+1,344 / (84 × 3). The cost is 688,128 reduction requests from the `atomicAdd`
+epilogue plus one pre-zeroing of the output.
 
-**The tell is wavefronts ≫ requests with DRAM traffic flat.** Every kernel in the
-pipeline slows 2.5–3.9× while DRAM bytes do not move at all — that combination can
-only be on-chip serialization. `Shared Memory` in Memory Workload Analysis reports
-the conflict count directly; `stall_short_scoreboard` rises in Warp State.
+## 4.2 Work thrown away → size the tile to the problem
 
-Fix: pad the shared row stride by one element. 4,473× fewer conflicts.
-The shipped kernel is *not* conflict-free — 663,937 remain, 0.18% of wavefronts.
+**Build:** Fixed `bq` tile · **Kernels changed:** 2a1, 2a2, 2c and 3d — every
+kernel whose row axis is `bq` and which therefore calls `bq_reg_for()` (3a and 3c
+tile over `flat`, not `bq`, and are untouched) · **GUI:** Instruction Statistics,
+then Launch Statistics.
 
-## 4.2 Operands re-staged from global → widen the block tile
+Same scenario, so there is exactly one real query row. Bounds are only checked at
+the write-out, so a tile pinned at 128 rows computes 128 rows and stores 1.
 
-**Report:** `WITHOUT_tile4` · **GUI:** Memory Workload Analysis → *Device Memory*,
-plus Occupancy.
+![Fixed 128-row `bq` tile](docs/Fixed_BQ.png)
+
+The grid is identical to the shipped build — 1,344 blocks, 344,064 threads, same
+split-K plan — so every difference below is per-thread work, not a different
+launch:
+
+| | Fixed 128-row tile | Shipped (16-row) |
+|---|--:|--:|
+| Executed instructions | 63,901,824 | 19,018,944 |
+| Issued instructions | 63,927,696 | 19,052,396 |
+| Avg. executed per scheduler | 190,184 | 56,604 |
+| FFMA thread-instructions | 1,409,286,144 | 176,160,768 |
+| Registers per thread | 125 | 79 |
+| Dynamic shared memory / block | 33.79 KB | 19.01 KB |
+| Waves Per SM | 8 | 5.33 |
+| **duration** | **226.72 µs** | **134.5 µs** |
+
+Reading it:
+
+- **FFMA thread-instructions are exactly 8×** for identical output — 128/16, the
+  ratio between the pinned tile and the 16-row floor `bq_reg_for()` selects. The
+  floor is `blockDim.y = 16`, so the shipped build still discards 15 rows of 16; it
+  just discards 8× fewer.
+- **Executed instructions rise only 3.36×**, not 8×. Staging, addressing and loop
+  control are per *block*, and the block count did not change — only the
+  register-tile arithmetic scaled with `kBqReg`. Issued tracks executed to within
+  0.04%, so nothing is replaying: this is real work thrown away, not a stall.
+- **125 vs 79 registers per thread** is the accumulator array. A thread holds
+  `acc_t s[kBqReg][8]` — 64 registers at `kBqReg = 8`, 8 at `kBqReg = 1`.
+- **Those registers then cost residency.** 125 × 256 = 32,000 registers per block,
+  so 65,536/32,000 caps the SM at 2 blocks instead of 3 — which is exactly why
+  Waves Per SM reads **8** against 5.33 for the same 1,344-block grid.
+- **Shared memory doubles off the same knob**: the staged slabs are
+  `(128 + 128) × 33 × 4 B = 33.79 KB` pinned against
+  `(16 + 128) × 33 × 4 B = 19.01 KB` adaptive.
+
+**1.69× for identical output**, and duration alone would not say where it went.
+Compare predicated-on instruction counts against *useful* output whenever a tile
+can be larger than its problem.
+
+## 4.3 Operands re-staged from global → widen the block tile
+
+**Build:** Narrow register tile · **Kernels changed:** 3a and 3c · **GUI:** Memory
+Workload Analysis → *Device Memory*, plus Occupancy.
 
 An M×N register tile costs M+N shared loads per M·N FMAs — 8×8 gives 0.25
 loads/FMA, 4×4 gives 0.5. But the more visible symptom is in **DRAM**:
 
 ```
-                                              WITHOUT_tile4       WITH
+                                                4×4 tile    shipped
     gpu__time_duration.sum        msecond            14.36        8.58
     dram__bytes.sum (3a)             byte      4.85 GB           3.30 GB   (+47%)
     dram__bytes.sum (3c)             byte      4.17 GB           2.69 GB   (+55%)
@@ -523,16 +548,16 @@ The trap: this build has *double* the occupancy (66.2% vs 33.0%) and is 36% slow
 end to end. **Occupancy is not the objective function.** If you tune to the
 Occupancy section alone you will make exactly this change and lose.
 
-## 4.3 Register spilling → do not over-request residency
+## 4.4 Register spilling → do not over-request residency
 
-**Report:** `WITHOUT_blocks3` · **GUI:** Occupancy, and Memory Workload Analysis →
-*Local* row.
+**Build:** Over-requested residency · **Kernels changed:** 3a and 3c · **GUI:**
+Occupancy, and Memory Workload Analysis → *Local* row.
 
 Asking for 3 resident blocks caps registers at 65,536/768 = 85; the accumulators
 alone need 64.
 
 ```
-                                                  WITHOUT_blocks3       WITH
+                                                   3 blocks/SM    shipped
     gpu__time_duration.sum                msecond           14.23       8.58
     launch__registers_per_thread  register/thread              80        107
     smsp__inst_executed_op_local_ld.sum      inst     138,359,040          0
@@ -546,13 +571,14 @@ for never arrives: 33.07% vs 33.04%, because shared memory already caps residenc
 at 2 blocks (33.8 KB × 3 = 101 KB > the SM's 100 KB). You pay the register cap and
 collect nothing.
 
-## 4.4 Shared memory capping residency → size the reduction tile to it
+## 4.5 Shared memory capping residency → size the reduction tile to it
 
-**Report:** `WITHOUT_red64` (too deep) and `WITHOUT_red16` (too shallow) ·
-**GUI:** Occupancy → *Shared Memory Per Block* and the occupancy-limiter chart.
+**Build:** Deep reduction tile (64, too deep) and shallow reduction tile (16, too
+shallow) · **Kernels changed:** 3a and 3c · **GUI:** Occupancy → *Shared Memory
+Per Block* and the occupancy-limiter chart.
 
 ```
-                                        WITHOUT_red64   WITH   WITHOUT_red16
+                                             depth 64  shipped  depth 16
     gpu__time_duration.sum   msecond           11.64    8.58            9.21
     sm__warps_active...pct         %           16.66   33.04           33.04
     launch__registers_per_thread             107      107             115
@@ -563,71 +589,41 @@ At depth 64 the block needs 67.6 KB of shared memory, so only one block fits and
 occupancy halves exactly — the Occupancy section names *Shared Memory* as the
 limiter. 36% slower.
 
-Depth 16 is the instructive failure: it reaches **zero** bank conflicts and is
-still 7% slower, because it doubles the tile count and therefore the barriers
+Depth 16 is the instructive failure: it reaches **zero** bank conflicts — the
+metric [4.6](#46-shared-memory-bank-conflicts--pad-the-row-stride) is about — and
+is still 7% slower, because it doubles the tile count and therefore the barriers
 (`stall_barrier` rises). **A metric improving is not the goal; time is.** 32 is the
 largest depth that keeps two blocks resident.
 
-## 4.5 Wave quantization → split the reduction
+## 4.6 Shared-memory bank conflicts → pad the row stride
 
-**Report:** `WITHOUT_nosplit` · **GUI:** Launch Statistics → *Waves Per SM*.
+**Build:** Unpadded shared stride · **Kernels changed:** every GEMM (3a and 3c
+shown) · **GUI:** Memory Workload Analysis → *Shared Memory* table, and the Warp
+State chart.
 
-At `bq = 1`, 2a1's output is 1536 columns = 12 block tiles on an 84-SM GPU.
-
-```
-                                                 WITHOUT_nosplit    WITH
-    gpu__time_duration.sum               msecond            1.03    0.13
-    launch__waves_per_multiprocessor                        0.05    5.33
-    sm__cycles_active.avg...pct                %           14.26
-    sm__warps_active...pct                     %           16.66   46.30
-```
-
-**`waves_per_multiprocessor = 0.05` is the whole diagnosis** — the grid fills 5% of
-a single wave, and `sm__cycles_active` confirms only 14% of the machine ever had
-work. This is a Launch Statistics number, not a memory or instruction one; nothing
-in Memory Workload Analysis would tell you. Splitting the reduction across `grid.z`
-gives 5.33 waves and **7.6×**. The cost appears as 688,128 reduction requests from
-the `atomicAdd` epilogue.
-
-## 4.6 Work thrown away → size the tile to the problem
-
-**Report:** `WITHOUT_fixedbq` · **GUI:** Instruction Statistics, and Compute
-Workload Analysis.
-
-A 128-row tile against a 1-row problem computes 128 rows and discards 127.
+Without padding, the row stride is a multiple of 32 floats, so column `r` of every
+row lands in the same bank and the strip's 8 column loads serialize.
 
 ```
-                                                   WITHOUT_fixedbq        WITH
-    gpu__time_duration.sum                usecond           226.72       134.5
-    smsp__sass_thread_inst_executed_op_ffma_pred_on  1,409,286,144  176,160,768
-    launch__registers_per_thread   register/thread              125          79
+                                                       unpadded   shipped
+    gpu__time_duration.sum                msecond          29.60       8.58
+    l1tex__data_bank_conflicts_..._op_ld.sum        2,944,680,278    663,937
+    l1tex__data_pipe_lsu_wavefronts_mem_shared_op_ld  3,313,000,000  368,713,732
 ```
 
-**Exactly 8× the FFMA thread-instructions for identical output** — the ratio
-between a 128-row tile and the 16-row floor. Compare predicated-on instructions
-against useful work whenever a tile can exceed its problem; the wasted lanes are
-invisible in duration alone.
+**The tell is wavefronts ≫ requests with DRAM traffic flat.** Every kernel in the
+pipeline slows 2.5–3.9× while DRAM bytes do not move at all — that combination can
+only be on-chip serialization. `Shared Memory` in Memory Workload Analysis reports
+the conflict count directly; `stall_short_scoreboard` rises in Warp State.
 
-## 4.7 Address math stealing issue slots → strength-reduce the staging loops
+Fix: pad the shared row stride by one element. 4,473× fewer conflicts.
+The shipped kernel is *not* conflict-free — 663,937 remain, 0.18% of wavefronts.
 
-**Report:** `WITHOUT_prestaging` · **GUI:** Instruction Statistics.
+## 4.7 The `scores` row stride — profile the consumer, not the producer
 
-```
-                                                 WITHOUT_prestaging          WITH
-    gpu__time_duration.sum               msecond               9.38          8.58
-    smsp__inst_executed.sum                 inst      2,450,441,216 2,258,875,136
-    smsp__..._op_integer_pred_on.sum        inst     13,814,125,056 8,514,286,080
-```
-
-Integer thread-instructions fall 38% and issued instructions 7.8% with FFMA work
-identical. The signature is a **uniform ~7–14% slowdown across every GEMM kernel
-with DRAM traffic flat** — no memory metric moves, so the cost has to be issue
-bandwidth.
-
-## 4.8 The `scores` row stride — profile the consumer, not the producer
-
-**Report:** `WITHOUT_noalign` · **GUI:** Memory Workload Analysis → *Device Memory*
-on **3c**, not 3a.
+**Build:** Unpadded `scores` stride · **Kernels changed:** 3a writes `scores`, 3c
+reads it back · **GUI:** Memory Workload Analysis → *Device Memory* on **3c**,
+not 3a.
 
 `scores` is `Sk` wide and `Sk` is a runtime value; at 4,989 a row is 19,956 B, so
 unpadded every row starts at a different offset in a cache line.
@@ -639,7 +635,7 @@ alone you would conclude the padding does not matter.**
 
 The cost lands on the consumer. 3c reads all of `scores` back:
 
-| | WITH | WITHOUT_noalign |
+| | shipped | unpadded stride |
 |---|--:|--:|
 | 3a sectors/request (global ST) | 3.60 | 5.00 |
 | 3c sectors/request (global LD) | 3.00 | 3.29 |
@@ -651,6 +647,23 @@ SOL), read across the producer–consumer pair, with `sectors_per_request` as th
 mechanism that explains it. Wall clock moves only ~0.5% here because 3c runs at 44%
 of peak DRAM throughput and has headroom to absorb 11% more bytes — but the traffic
 is real and binds on a more bandwidth-limited part or a longer `Sk`.
+
+## 4.8 Address math stealing issue slots → strength-reduce the staging loops
+
+**Build:** Plain staging loops · **Kernels changed:** all five GEMMs (3a and 3c
+shown) · **GUI:** Instruction Statistics.
+
+```
+                                                     plain staging       shipped
+    gpu__time_duration.sum               msecond               9.38          8.58
+    smsp__inst_executed.sum                 inst      2,450,441,216 2,258,875,136
+    smsp__..._op_integer_pred_on.sum        inst     13,814,125,056 8,514,286,080
+```
+
+Integer thread-instructions fall 38% and issued instructions 7.8% with FFMA work
+identical. The signature is a **uniform ~7–14% slowdown across every GEMM kernel
+with DRAM traffic flat** — no memory metric moves, so the cost has to be issue
+bandwidth.
 
 ## 4.9 Choices validated by a counter reading zero
 
@@ -710,4 +723,5 @@ subset. Use `--phase decode` for all seven.
 | `kernel_profile.py` | `torch.profiler` breakdown of kernel 3's sub-stages |
 | `check_dtypes.py` | Correctness sweep across fp16/fp32/fp64, plain and split-K paths |
 | `check_3d.py` | Correctness sweep over shapes straddling tile boundaries |
-| `docs/make_figures.py` | Regenerates every figure above and `docs/mla_figures.pdf` |
+| `docs/make_figures.py` | Regenerates every pipeline figure above and `docs/mla_figures.pdf` |
+| `docs/*_BQ.*`, `docs/*K-Split*` | Nsight Compute screenshots used in [Section 4](#4-profiling-different-stages-with-nsight-compute) (PDF as captured, PNG for the README) |
