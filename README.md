@@ -715,29 +715,12 @@ The counters confirm it. On the raw page:
 Fix: pad the shared row stride by one element. 4,337× fewer conflicts, and every
 GEMM in the pipeline speeds up 3.4–3.9×.
 
-The shipped kernel's remaining 678,848 are **not** an access-pattern defect, which
-is worth knowing before anyone tries to optimise them away. Building with
-`-lineinfo` and opening the **Source** page attributes conflicts per instruction,
-and every `LDS` and `STS` in the kernel reports `L1 Wavefronts Shared Excessive = 0`
-and `N-Way = 1` — actual wavefronts equal Nsight's own conflict-free ideal, exactly
-(391,039,488 both). A standalone microbenchmark of the two patterns agrees: the
-strip load replays 4.25× at stride 32 and exactly 1.00× at stride 33, and the
-staging store is conflict-free at *either* stride, since its fast axis already
-spans all 32 banks.
-
-What the aggregate counter is picking up is the gap between total wavefronts
-(394,205,191) and the sum of per-instruction wavefronts (391,039,488) — replays
-that belong to no instruction's addressing. The best-supported explanation is
-contention between concurrently-issued warps: on Ampere the SM's four
-sub-partitions share one shared-memory unit, so two individually conflict-free
-warps can still collide on banks in the same cycle. That fits the evidence — the
-rate is fixed and shape-independent (0.18/0.19/0.19% at `Sk` = 4,989 / 8,192 /
-2,048, ragged or exact), and stores conflict 50× more than loads (9.9% vs 0.19%)
-because staging issues 32 back-to-back `STS` from 8 warps with no compute between
-them, while each strip `LDS` is separated by 64 FFMAs. The microbenchmark
-reproduces the direction — 0 conflicts at 84 blocks, 634 at 4,992 blocks and 81%
-occupancy — but not the magnitude, so this is the best-supported reading rather
-than a proven one. Either way it is 0.8% of shared traffic and not actionable.
+The remaining 678,848 are **not** an access-pattern defect, so they are not worth
+chasing. Built with `-lineinfo`, the Source page attributes conflicts per
+instruction, and every `LDS` and `STS` reports *excessive wavefronts = 0* — the
+addressing is already Nsight's own conflict-free ideal. The residue is most likely
+warps colliding on banks in the same cycle, which no choice of stride fixes. It is
+0.18% of shared traffic.
 
 ## 4.6 The `scores` row stride — profile the consumer, not the producer
 
